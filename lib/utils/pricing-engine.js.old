@@ -1,0 +1,552 @@
+/**
+ * @fileoverview
+ * Pricing Engine utility for calculating strategic order prices and estimating trade fees.
+ * This engine combines pricing strategies with actual exchange fee data to provide
+ * comprehensive pricing information for trading decisions.
+ * 
+ * @see {@link /docs/trading/PRICING_STRATEGIES_REFERENCE.md} - Complete pricing strategies documentation
+ */
+
+// Placeholder for potential imports like a logger if not passed in constructor
+// import { TradingLogger } from '../../../utils/trading-logger.js';
+
+/**
+ * @typedef {Object} PricingStrategyConfig
+ * @property {Object} buy - Buy side pricing strategy
+ * @property {string} buy.mode - Pricing mode (e.g., "SPREAD", "PERCENTAGE")
+ * @property {number} buy.percentage - Percentage for modes that use it
+ * @property {Object} sell - Sell side pricing strategy
+ * @property {string} sell.mode - Pricing mode
+ * @property {number} sell.percentage - Percentage
+ * // ... other strategy-specific parameters might be added
+ */
+
+/**
+ * @typedef {Object} ActualExchangeFeeRates
+ * @property {number | null} maker - Maker fee rate as a decimal (e.g., 0.001 for 0.1%)
+ * @property {number | null} taker - Taker fee rate as a decimal
+ * @property {number | null} lastUpdated - Timestamp of when rates were last updated
+ */
+
+class PricingEngine {
+  /**
+   * Creates a new PricingEngine instance.
+   * @param {Object} options - Configuration options.
+   * @param {PricingStrategyConfig} options.pricingStrategyConfig - REQUIRED: Defines how to price orders strategically.
+   * @param {ActualExchangeFeeRates} [options.actualExchangeFeeRates] - Optional initial actual exchange fee rates.
+   * @param {Object} [options.logger] - Optional logger instance.
+   */
+  constructor(options = {}) {
+    this.logger = options.logger || console; // Basic fallback logger
+
+    // Validate that pricing strategy configuration is provided
+    if (!options.pricingStrategyConfig) {
+      const error = new Error('PricingEngine requires explicit pricingStrategyConfig. No default pricing strategy is provided to ensure conscious configuration decisions.');
+      this.logger.error('[PricingEngine] Missing required pricingStrategyConfig', {
+        error: error.message,
+        providedOptions: Object.keys(options)
+      });
+      throw error;
+    }
+
+    // Validate required pricing strategy structure
+    if (!options.pricingStrategyConfig.buy || !options.pricingStrategyConfig.sell) {
+      const error = new Error('PricingEngine requires pricingStrategyConfig with both buy and sell configurations.');
+      this.logger.error('[PricingEngine] Invalid pricingStrategyConfig structure', {
+        error: error.message,
+        hasBuy: !!options.pricingStrategyConfig.buy,
+        hasSell: !!options.pricingStrategyConfig.sell,
+        config: JSON.stringify(options.pricingStrategyConfig)
+      });
+      throw error;
+    }
+
+    // Validate buy and sell configurations have required mode
+    if (!options.pricingStrategyConfig.buy.mode || !options.pricingStrategyConfig.sell.mode) {
+      const error = new Error('PricingEngine requires both buy.mode and sell.mode to be specified in pricingStrategyConfig.');
+      this.logger.error('[PricingEngine] Missing required pricing modes', {
+        error: error.message,
+        buyMode: options.pricingStrategyConfig.buy.mode,
+        sellMode: options.pricingStrategyConfig.sell.mode,
+        config: JSON.stringify(options.pricingStrategyConfig)
+      });
+      throw error;
+    }
+
+    this.pricingStrategyConfig = options.pricingStrategyConfig;
+
+    this.actualExchangeFeeRates = options.actualExchangeFeeRates || {
+      maker: null,
+      taker: null,
+      lastUpdated: null,
+    };
+
+    this.logger.info('PricingEngine initialized with explicit configuration', {
+      pricingStrategyConfig: JSON.stringify(this.pricingStrategyConfig),
+      actualExchangeFeeRates: JSON.stringify(this.actualExchangeFeeRates),
+    });
+  }
+
+  /**
+   * Updates the pricing strategy configuration.
+   * @param {PricingStrategyConfig} newConfig - The new pricing strategy configuration.
+   */
+  updatePricingStrategyConfig(newConfig) {
+    if (!newConfig) {
+      this.logger.warn('[PricingEngine] Attempted to update with null/undefined pricingStrategyConfig.');
+      return;
+    }
+    
+    // Create a new object to avoid mutating the old one directly if newConfig === this.pricingStrategyConfig
+    const updatedStrategyConfig = { ...this.pricingStrategyConfig };
+
+    // If newConfig explicitly provides 'buy' or 'sell', use that value (can be null or an object)
+    if (Object.prototype.hasOwnProperty.call(newConfig, 'buy')) {
+      updatedStrategyConfig.buy = newConfig.buy;
+    }
+    if (Object.prototype.hasOwnProperty.call(newConfig, 'sell')) {
+      updatedStrategyConfig.sell = newConfig.sell;
+    }
+    
+    // For any other top-level keys in newConfig (e.g., 'feeCurrency')
+    // This ensures other parts of the config can also be updated.
+    for (const key in newConfig) {
+      if (Object.prototype.hasOwnProperty.call(newConfig, key) && key !== 'buy' && key !== 'sell') {
+        updatedStrategyConfig[key] = newConfig[key];
+      }
+    }
+    this.pricingStrategyConfig = updatedStrategyConfig;
+
+    this.logger.info('PricingEngine: pricingStrategyConfig updated.', {
+      // Log the new state of the entire pricingStrategyConfig
+      // The test expectation for the logged object is `expect.any(Object)` 
+      // but using 'newConfig' as key for the stringified object for consistency if any test relied on it implicitly.
+      newConfig: JSON.stringify(this.pricingStrategyConfig)
+    });
+  }
+
+  /**
+   * Updates the actual known exchange fee rates.
+   * @param {ActualExchangeFeeRates} feeRates - The new fee rates.
+   */
+  updateActualFeeRates(feeRates) {
+    if (!feeRates || typeof feeRates !== 'object') {
+      this.logger.warn('[PricingEngine] Invalid feeRates provided to updateActualFeeRates.', { feeRates });
+      return;
+    }
+
+    this.actualExchangeFeeRates = {
+      maker: typeof feeRates.maker === 'number' ? feeRates.maker : this.actualExchangeFeeRates.maker,
+      taker: typeof feeRates.taker === 'number' ? feeRates.taker : this.actualExchangeFeeRates.taker,
+      lastUpdated: feeRates.lastUpdated || Date.now(),
+    };
+
+    this.logger.info('PricingEngine: actualExchangeFeeRates updated.', {
+      rates: JSON.stringify(this.actualExchangeFeeRates)
+    });
+  }
+
+  // --- Placeholder for Core Pricing Methods (Task X.2) ---
+
+  /**
+   * (Internal helper) Calculate a fee-based price level for specialized pricing strategies.
+   * This was previously in FeeCalculator.
+   * @param {number} basePrice - Base price to calculate from
+   * @returns {number} - Calculated price level
+   */
+
+  /**
+   * (Internal helper) Calculates the true break-even sell price that accounts for both buy and sell fees.
+   * This solves the equation: total_buy_cost = net_sell_revenue
+   * Where: buy_price * (1 + buy_fee) = sell_price * (1 - sell_fee)
+   * Therefore: sell_price = (buy_price * (1 + buy_fee)) / (1 - sell_fee)
+   * 
+   * @param {number} buyPrice - The original buy price (entry price)
+   * @param {number} buyFeeRate - The fee rate applied to the buy side (as decimal, e.g., 0.0025 for 0.25%)
+   * @param {number} sellFeeRate - The fee rate applied to the sell side (as decimal)
+   * @returns {number} The break-even sell price
+   */
+  _calculateTrueBreakEvenPrice(buyPrice, buyFeeRate, sellFeeRate) {
+    if (typeof buyPrice !== 'number' || buyPrice <= 0) {
+      this.logger.error('[PricingEngine._calculateTrueBreakEvenPrice] Invalid buyPrice', { buyPrice });
+      return NaN;
+    }
+    
+    if (typeof buyFeeRate !== 'number' || buyFeeRate < 0) {
+      this.logger.error('[PricingEngine._calculateTrueBreakEvenPrice] Invalid buyFeeRate', { buyFeeRate });
+      return NaN;
+    }
+    
+    if (typeof sellFeeRate !== 'number' || sellFeeRate < 0 || sellFeeRate >= 1) {
+      this.logger.error('[PricingEngine._calculateTrueBreakEvenPrice] Invalid sellFeeRate (must be < 1)', { sellFeeRate });
+      return NaN;
+    }
+    
+    const totalBuyCost = buyPrice * (1 + buyFeeRate);
+    const breakEvenSellPrice = totalBuyCost / (1 - sellFeeRate);
+    
+    this.logger.debug('[PricingEngine._calculateTrueBreakEvenPrice] Calculation completed', {
+      buyPrice,
+      buyFeeRate,
+      sellFeeRate,
+      totalBuyCost,
+      breakEvenSellPrice,
+      formula: '(buyPrice * (1 + buyFee)) / (1 - sellFee)'
+    });
+    
+    return breakEvenSellPrice;
+  }
+
+  /**
+   * Calculates the gross order price based on the configured strategy.
+   * This is the price to be placed on the exchange order book.
+   * @param {Object} params
+   * @param {string} params.side - 'buy' or 'sell'.
+   * @param {number} params.midPrice - Current market mid-price.
+   * @param {number} params.spread - Current market spread.
+   * @param {number} [params.entryPrice] - Optional entry price (e.g., for take-profit sell calculations).
+   * @param {string} [params.orderType='limit'] - Intended order type, might influence strategy or fee estimation for modes like BREAK_EVEN (covers both buy and sell fees).
+   * @param {boolean} [params.isTakeProfit=false] - Whether this is a take-profit order (requires entry price for sells).
+   * @returns {number} The calculated gross order price, or NaN if calculation fails.
+   */
+  calculateGrossOrderPrice({ side, midPrice, spread, entryPrice = null, orderType = 'limit', isTakeProfit = false }) {
+    this.logger.debug('[PricingEngine.calculateGrossOrderPrice] Starting calculation...', { side, midPrice, spread, entryPrice, orderType, isTakeProfit, config: this.pricingStrategyConfig });
+
+    // Validate inputs
+    if (typeof midPrice !== 'number' || isNaN(midPrice) || midPrice <= 0) {
+      this.logger.error('[PricingEngine] Invalid midPrice provided.', { midPrice });
+      return NaN;
+    }
+
+    if (typeof spread !== 'number' || isNaN(spread)) {
+      this.logger.error('[PricingEngine] Invalid spread provided.', { spread });
+      return NaN;
+    }
+
+    const strategyConfig = side === 'buy' ? this.pricingStrategyConfig.buy : this.pricingStrategyConfig.sell;
+
+    if (!strategyConfig || !strategyConfig.mode) {
+      this.logger.error('[PricingEngine] Missing strategy configuration.', { side, strategyConfig });
+      return NaN;
+    }
+
+    // For take-profit sell orders, entry price is REQUIRED
+    if (isTakeProfit && side === 'sell') {
+      if (entryPrice === null || typeof entryPrice !== 'number' || isNaN(entryPrice) || entryPrice <= 0) {
+        this.logger.error('[PricingEngine] Take-profit sell orders require valid entryPrice.', { entryPrice, isTakeProfit, side });
+        return NaN;
+      }
+
+      // Validate that sell strategy is appropriate for take-profit (entry-based)
+      const entryBasedSellModes = ['BREAK_EVEN', 'TARGET_PROFIT', 'ENTRY_MARKUP', 'SPREAD_CAPTURE'];
+      if (!entryBasedSellModes.includes(strategyConfig.mode)) {
+        this.logger.error('[PricingEngine] Take-profit sell orders require entry-based pricing strategy.', {
+          currentMode: strategyConfig.mode,
+          allowedModes: entryBasedSellModes,
+          isTakeProfit,
+          side
+        });
+        return NaN;
+      }
+    }
+
+    const configPercentage = strategyConfig.percentage; // The strategic percentage, not necessarily the exchange fee.
+
+    // Base price for sell-side calculations that use entryPrice
+    // For take-profit sells, ALWAYS use entryPrice (already validated above)
+    // For regular sells, use entryPrice if provided, otherwise midPrice
+    const basePriceForSell = (isTakeProfit && side === 'sell') ? entryPrice : (entryPrice !== null ? entryPrice : midPrice);
+    let price;
+
+    try {
+      if (side === 'buy') {
+        // --- BUY SIDE LOGIC ---
+        const buyMode = strategyConfig.mode;
+        this.logger.info('[PricingEngine.calculateGrossOrderPrice] BUY mode processing', { buyMode, midPrice, spread, configPercentage });
+
+        // Validate buy-side strategies
+        const validBuyModes = ['MARKET_EDGE', 'EDGE_OFFSET', 'INSIDE_MARKET', 'MIDPOINT_OFFSET', 'FEE_ADJUSTED', 'TAKER_PRICE'];
+        if (!validBuyModes.includes(buyMode)) {
+          this.logger.error('[PricingEngine] Invalid buy strategy mode.', { buyMode, validModes: validBuyModes });
+          return NaN;
+        }
+
+        switch(buyMode) {
+          case "MARKET_EDGE":
+            price = midPrice - (spread / 2);
+            break;
+          case "EDGE_OFFSET":
+            if (typeof configPercentage !== 'number' || isNaN(configPercentage)) {
+              this.logger.error('[PricingEngine] Invalid percentage in buy strategy for EDGE_OFFSET', { strategyConfig });
+              return NaN;
+            } else {
+              const baseBuyPriceSp = midPrice - (spread / 2);
+              price = baseBuyPriceSp * (1 - configPercentage);
+            }
+            break;
+          case "INSIDE_MARKET":
+            price = midPrice - (spread / 4);
+            break;
+          case "MIDPOINT_OFFSET":
+            if (typeof configPercentage !== 'number' || isNaN(configPercentage)) {
+              this.logger.error('[PricingEngine] Invalid percentage in buy strategy for MIDPOINT_OFFSET', { strategyConfig });
+              return NaN;
+            } else {
+              price = midPrice * (1 + configPercentage);
+            }
+            break;
+          case "FEE_ADJUSTED":
+            // For FEE_ADJUSTED, considers the cost of the trade (taker fee for aggressive entry).
+            const takerFeeRate = this.actualExchangeFeeRates.taker !== null ? this.actualExchangeFeeRates.taker : 0;
+            // Use taker fee rate directly as it's already in decimal format (0.001 = 0.1%)
+            price = midPrice * (1 - takerFeeRate);
+
+            this.logger.debug('[PricingEngine] BUY FEE_ADJUSTED pricing', {
+              actualTakerFeeRate: takerFeeRate,
+              midPrice,
+              calculatedPrice: price
+            });
+            break;
+          case "TAKER_PRICE": // For a buy market order, takes liquidity at the market price
+            // For buy: pay the ask price to get immediate execution (take liquidity)
+            price = midPrice + (spread / 2); // This equals bestAsk for buy orders
+            this.logger.debug('[PricingEngine] BUY TAKER_PRICE pricing - using bestAsk for immediate execution', {
+              midPrice,
+              spread,
+              bestAsk: price
+            });
+            break;
+          default:
+            this.logger.error(`[PricingEngine] Unhandled buy strategy mode: ${buyMode}.`);
+            return NaN;
+        }
+      } else {
+        // --- SELL SIDE LOGIC ---
+        const sellMode = strategyConfig.mode;
+        this.logger.info('[PricingEngine.calculateGrossOrderPrice] SELL mode processing', { sellMode, basePriceForSell, midPrice, spread, configPercentage, entryPrice, isTakeProfit });
+
+        // Validate sell-side strategies
+        const validSellModes = ['BREAK_EVEN', 'TARGET_PROFIT', 'ENTRY_MARKUP', 'MARKET_EDGE', 'INSIDE_MARKET', 'SPREAD_CAPTURE', 'TAKER_PRICE'];
+        if (!validSellModes.includes(sellMode)) {
+          this.logger.error('[PricingEngine] Invalid sell strategy mode.', { sellMode, validModes: validSellModes });
+          return NaN;
+        }
+
+        switch(sellMode) {
+          case "BREAK_EVEN": // This mode covers BOTH buy-side fees (already paid) AND sell-side fees (to be paid)
+            // REQUIRES entry price for meaningful calculation
+            if (!basePriceForSell || basePriceForSell <= 0) {
+              this.logger.error('[PricingEngine] BREAK_EVEN strategy requires valid entry price.', { basePriceForSell, entryPrice });
+              return NaN;
+            }
+            const makerFeeRateFO = this.actualExchangeFeeRates.maker !== null ? this.actualExchangeFeeRates.maker : 0;
+            
+            // Use helper method for mathematically correct break-even calculation
+            const breakEvenPrice = this._calculateTrueBreakEvenPrice(basePriceForSell, makerFeeRateFO, makerFeeRateFO);
+            if (isNaN(breakEvenPrice)) {
+              this.logger.error('[PricingEngine] Failed to calculate break-even price', { basePriceForSell, makerFeeRateFO });
+              return NaN;
+            }
+            
+            // Add the configured percentage on top if specified (default 0 for pure break-even)
+            const strategicPercentage = configPercentage || 0;
+            price = strategicPercentage > 0 ? breakEvenPrice * (1 + strategicPercentage) : breakEvenPrice;
+            
+            this.logger.debug('[PricingEngine] SELL BREAK_EVEN pricing - using helper method', {
+              actualMakerFeeRate: makerFeeRateFO,
+              entryPrice: basePriceForSell,
+              breakEvenPrice: breakEvenPrice,
+              strategicPercentage: strategicPercentage,
+              finalCalculatedPrice: price,
+              explanation: 'Uses _calculateTrueBreakEvenPrice helper + strategic%'
+            });
+            break;
+          case "TARGET_PROFIT": // Covers BOTH buy and sell fees + additional strategic percentage for profit.
+            // REQUIRES entry price for meaningful calculation
+            if (!basePriceForSell || basePriceForSell <= 0) {
+              this.logger.error('[PricingEngine] TARGET_PROFIT strategy requires valid entry price.', { basePriceForSell, entryPrice });
+              return NaN;
+            }
+            if (typeof configPercentage !== 'number' || isNaN(configPercentage)) {
+              this.logger.error('[PricingEngine] Invalid percentage in sell strategy for TARGET_PROFIT', { strategyConfig });
+              return NaN;
+            } else {
+              const makerFeeRateFPP = this.actualExchangeFeeRates.maker !== null ? this.actualExchangeFeeRates.maker : 0;
+              
+              // Use helper method for mathematically correct break-even, then add profit
+              const breakEvenPrice = this._calculateTrueBreakEvenPrice(basePriceForSell, makerFeeRateFPP, makerFeeRateFPP);
+              if (isNaN(breakEvenPrice)) {
+                this.logger.error('[PricingEngine] Failed to calculate break-even price for TARGET_PROFIT', { basePriceForSell, makerFeeRateFPP });
+                return NaN;
+              }
+              
+              price = breakEvenPrice * (1 + configPercentage);
+              
+              this.logger.debug('[PricingEngine] SELL TARGET_PROFIT pricing - using helper method', {
+                actualMakerFeeRate: makerFeeRateFPP,
+                entryPrice: basePriceForSell,
+                breakEvenPrice: breakEvenPrice,
+                strategicProfitPercentage: configPercentage,
+                finalCalculatedPrice: price,
+                explanation: 'Uses _calculateTrueBreakEvenPrice helper + profit percentage'
+              });
+            }
+            break;
+          case "ENTRY_MARKUP":
+            // REQUIRES entry price for meaningful calculation
+            if (!basePriceForSell || basePriceForSell <= 0) {
+              this.logger.error('[PricingEngine] ENTRY_MARKUP strategy requires valid entry price.', { basePriceForSell, entryPrice });
+              return NaN;
+            }
+            if (typeof configPercentage !== 'number' || isNaN(configPercentage)) {
+              this.logger.error('[PricingEngine] Invalid percentage in sell strategy for ENTRY_MARKUP', { strategyConfig });
+              return NaN;
+            } else {
+              price = basePriceForSell * (1 + configPercentage);
+            }
+            break;
+          case "SPREAD_CAPTURE": // Sell at a price that captures the full spread from entry
+            // REQUIRES entry price for meaningful calculation
+            if (!basePriceForSell || basePriceForSell <= 0) {
+              this.logger.error('[PricingEngine] SPREAD_CAPTURE strategy requires valid entry price.', { basePriceForSell, entryPrice });
+              return NaN;
+            }
+            // Use the actual entry price and add the current spread
+            price = basePriceForSell + spread;
+            this.logger.debug('[PricingEngine] SELL SPREAD_CAPTURE pricing - capturing full spread from entry', {
+              entryPrice: basePriceForSell,
+              spread,
+              targetPrice: price,
+              profitAmount: spread
+            });
+            break;
+          case "MARKET_EDGE": // Standard sell at best ask
+            price = midPrice + (spread / 2);
+            break;
+          case "INSIDE_MARKET": // Sell slightly inside the best ask
+            price = midPrice + (spread / 4);
+            break;
+          case "TAKER_PRICE": // For a sell market order, takes liquidity at the market price
+            // For sell: hit the bid price to get immediate execution (take liquidity)
+            price = midPrice - (spread / 2); // This equals bestBid for sell orders
+            this.logger.debug('[PricingEngine] SELL TAKER_PRICE pricing - using bestBid for immediate execution', {
+              midPrice,
+              spread,
+              bestBid: price
+            });
+            break;
+          default:
+            this.logger.error(`[PricingEngine] Unhandled sell strategy mode: ${sellMode}.`);
+            return NaN;
+        }
+      }
+
+      if (isNaN(price) || price <= 0) {
+        this.logger.error('[PricingEngine] Gross order price calculation resulted in NaN or non-positive value.', {
+          side, strategyMode: strategyConfig ? strategyConfig.mode : 'UNKNOWN_CONFIG_OR_MODE', midPrice, spread, entryPrice, configPercentage, calculatedPriceAttempt: price, isTakeProfit
+        });
+        return NaN; // No fallback for invalid calculations - fail explicitly
+      }
+
+      this.logger.info('[PricingEngine.calculateGrossOrderPrice] COMPLETED', {
+         side, strategyMode: strategyConfig.mode, midPrice, spread, entryPrice, configPercentage, calculatedPrice: price, isTakeProfit
+      });
+      return price;
+
+    } catch (error) {
+      this.logger.error('[PricingEngine.calculateGrossOrderPrice] Unexpected error.', {
+        error: error.message,
+        stack: error.stack,
+        side, midPrice, spread, entryPrice, strategyConfig: JSON.stringify(strategyConfig), isTakeProfit
+      });
+      return NaN;
+    }
+  }
+
+  /**
+   * Calculates the estimated monetary fee for a trade.
+   * @param {Object} params
+   * @param {string} params.side - 'buy' or 'sell'.
+   * @param {number} params.grossOrderPrice - The gross price of the trade.
+   * @param {number} params.amount - The amount/volume of the trade.
+   * @param {string} [params.orderType='limit'] - Type of order ('limit', 'market'), influences maker/taker.
+   * @returns {Object} Estimated fee details { feeAmount, feeRate, feeCurrency, feeStrategyUsed }.
+   */
+  getEstimatedFeeDetails({ side, grossOrderPrice, amount, orderType = 'limit' }) {
+    if (typeof grossOrderPrice !== 'number' || isNaN(grossOrderPrice) ||
+        typeof amount !== 'number' || isNaN(amount)) {
+      this.logger.error('[PricingEngine.getEstimatedFeeDetails] Invalid grossOrderPrice or amount.', { grossOrderPrice, amount });
+      return { feeAmount: NaN, feeRate: NaN, feeCurrency: this.pricingStrategyConfig.feeCurrency || 'USD', feeStrategyUsed: undefined };
+    }
+
+    let feeRate = 0;
+    let feeStrategyUsed;
+
+    if (orderType === 'market') {
+      feeRate = this.actualExchangeFeeRates.taker !== null ? this.actualExchangeFeeRates.taker : 0;
+      feeStrategyUsed = 'taker';
+    } else { // 'limit' or other types assumed to be maker
+      feeRate = this.actualExchangeFeeRates.maker !== null ? this.actualExchangeFeeRates.maker : 0;
+      feeStrategyUsed = 'maker';
+    }
+
+    const feeAmount = grossOrderPrice * amount * feeRate;
+    
+    // Determine fee currency. This might come from config, or be pair-specific.
+    // For now, let's assume it's related to the quote currency of a trading pair,
+    // or a default like USD if not specified.
+    // The original test expected 'USD' but the code returned 'quote'.
+    // Let's make it configurable via pricingStrategyConfig.feeCurrency, defaulting to 'quote' if not set.
+    const feeCurrency = this.pricingStrategyConfig.feeCurrency || 'quote';
+
+    this.logger.debug('[PricingEngine.getEstimatedFeeDetails]', { side, grossOrderPrice, amount, orderType, feeRate, feeAmount, feeCurrency, feeStrategyUsed });
+    return { feeAmount, feeRate, feeCurrency, feeStrategyUsed };
+  }
+
+  /**
+   * (Optional) Calculates the net execution price after estimated fees.
+   * This returns the effective price per unit after accounting for fees.
+   * @param {Object} params
+   * @param {string} params.side - 'buy' or 'sell'.
+   * @param {number} params.grossOrderPrice - The gross price of the trade.
+   * @param {number} params.amount - The amount/volume of the trade.
+   * @param {string} [params.orderType='limit'] - Type of order.
+   * @returns {number} The net price per unit after accounting for estimated fees, or NaN.
+   */
+  calculateNetExecutionPrice({ side, grossOrderPrice, amount, orderType = 'limit' }) {
+    if (typeof grossOrderPrice !== 'number' || isNaN(grossOrderPrice) ||
+        typeof amount !== 'number' || isNaN(amount) || amount === 0) { // Added amount === 0 check
+      this.logger.error('[PricingEngine.calculateNetExecutionPrice] Invalid grossOrderPrice or amount (cannot be 0).', { grossOrderPrice, amount });
+      return NaN;
+    }
+
+    const { feeRate } = this.getEstimatedFeeDetails({ side, grossOrderPrice, amount, orderType });
+
+    if (isNaN(feeRate)) { // Should not happen if getEstimatedFeeDetails is robust, but good check.
+        this.logger.error('[PricingEngine.calculateNetExecutionPrice] Could not determine fee rate.', { feeRate });
+        return NaN;
+    }
+
+    let netPricePerUnit;
+    if (side === 'buy') {
+      // For buy: net price per unit = gross price per unit * (1 + fee rate)
+      netPricePerUnit = grossOrderPrice * (1 + feeRate);
+    } else if (side === 'sell') {
+      // For sell: net price per unit = gross price per unit * (1 - fee rate)  
+      netPricePerUnit = grossOrderPrice * (1 - feeRate);
+    }
+    
+    this.logger.debug('[PricingEngine.calculateNetExecutionPrice] Calculated net price per unit', {
+      side,
+      grossOrderPrice,
+      amount,
+      feeRate,
+      netPricePerUnit,
+      explanation: side === 'buy' ? 'grossPrice * (1 + feeRate)' : 'grossPrice * (1 - feeRate)'
+    });
+    
+    return netPricePerUnit;
+  }
+}
+
+export default PricingEngine; 

@@ -5,9 +5,9 @@
  * providing a consistent API for the Adaptive Market Maker.
  */
 
-import { TradingLogger } from '../../../lib/utils/trading-logger.js';
+import { TradingLogger } from '../../lib/utils/trading-logger.js';
 import { AdaptiveMarketMakerExchangeAdapter } from './AdaptiveMarketMakerExchangeAdapter.js';
-import { KrakenPrivateWebSocketAdapter } from '../../../lib/exchanges/KrakenPrivateWebSocketAdapter.js';
+import { KrakenPrivateWebSocketAdapter } from '../../lib/exchanges/KrakenPrivateWebSocketAdapter.js';
 
 /**
  * Kraken Exchange Adapter for Adaptive Market Maker

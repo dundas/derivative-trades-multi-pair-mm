@@ -12,10 +12,9 @@
  * - Categorized logs (orders, trades, etc.)
  */
 
-import { TradingLogger } from '../../../utils/trading-logger.js';
+import { TradingLogger } from '../lib/utils/trading-logger.js';
 import fs from 'fs';
 import path from 'path';
-import RotatingFileTransport from '../../../lib/logging/rotating-file-transport.js';
 
 
 // Define log levels

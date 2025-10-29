@@ -9,9 +9,9 @@
  */
 
 import { EventEmitter } from 'events';
-import OrderBookBufferManager from '../../../lib/utils/order-book-buffer-manager.js';
-import { KrakenFuturesRESTClient } from '../../../lib/exchanges/KrakenFuturesRESTClient.js';
-import { CircularBuffer } from '../../../lib/utils/circular-buffer.js';
+import OrderBookBufferManager from '../../lib/utils/order-book-buffer-manager.js';
+import { KrakenFuturesRESTClient } from '../../lib/exchanges/KrakenFuturesRESTClient.js';
+import { CircularBuffer } from '../../lib/utils/circular-buffer.js';
 
 const FUTURES_PAIRS_MAP = {
   'BTC/USD': 'PF_XBTUSD',

@@ -1,0 +1,1849 @@
+/**
+ * TradingDecisionEngine
+ * 
+ * A core component for market analysis and trading decision making in the AdaptiveMarketMaker.
+ * Analyzes orderbook data, market trends, and price movements to make informed trading decisions.
+ * Supports real-time event processing, multi-timeframe analysis, and configurable trading signals.
+ * 
+ * Key features:
+ * - Real-time orderbook analysis with MemoryManager integration
+ * - Multi-timeframe trend detection (1m, 5m, 15m)
+ * - Spread analysis and significant change detection
+ * - Market direction identification (uptrend/downtrend)
+ * - Force trading mode for testing and specific market conditions
+ */
+
+import { TradingLogger } from '../../../utils/trading-logger.js';
+import { EventEmitter } from 'events';
+import { RiskEngine } from './risk/index.js';
+import { SpreadCalculator } from './spread-calculator.js';
+import PricingEngine from '../../../lib/trading/pricing-engine.js';
+import { validateAndNormalizePricingStrategyConfig } from './pricing_strategy_adapter.js';
+import PriceProvider from './price-provider.js';
+
+/**
+ * TradingDecisionEngine class
+ * Core decision-making component for the AdaptiveMarketMaker
+ */
+class TradingDecisionEngine extends EventEmitter {
+  /**
+   * Update OHLC data and recalculate volatility metrics
+   * @param {Array} ohlcData - Array of OHLC candles
+   */
+  updateOhlcData(ohlcData) {
+    if (!Array.isArray(ohlcData)) {
+      this.logger.warn('[TDE] Invalid OHLC data provided to updateOhlcData');
+      return;
+    }
+    
+    this.ohlcData = ohlcData.slice(-this.ohlcConfig.maxCandles); // Keep only recent candles
+    
+    // Calculate volatility metrics if we have enough data
+    if (this.ohlcData.length >= this.ohlcConfig.volatilityPeriod) {
+      this._calculateVolatilityMetrics();
+      this._detectVolatilityRegime();
+      
+      this.logger.debug('[TDE] OHLC data updated', {
+        candleCount: this.ohlcData.length,
+        latestCandle: this.ohlcData[this.ohlcData.length - 1],
+        volatilityMetrics: this.volatilityMetrics
+      });
+    }
+  }
+  
+  /**
+   * Calculate volatility metrics from OHLC data
+   * @private
+   */
+  _calculateVolatilityMetrics() {
+    const period = this.ohlcConfig.volatilityPeriod;
+    const recentCandles = this.ohlcData.slice(-period);
+    
+    // Calculate returns
+    const returns = [];
+    for (let i = 1; i < recentCandles.length; i++) {
+      const prevClose = recentCandles[i - 1].close;
+      const currClose = recentCandles[i].close;
+      if (prevClose > 0) {
+        returns.push((currClose - prevClose) / prevClose);
+      }
+    }
+    
+    // Calculate standard deviation of returns (volatility)
+    if (returns.length > 0) {
+      const mean = returns.reduce((sum, r) => sum + r, 0) / returns.length;
+      const variance = returns.reduce((sum, r) => sum + Math.pow(r - mean, 2), 0) / returns.length;
+      this.volatilityMetrics.volatility = Math.sqrt(variance);
+    }
+    
+    // Calculate ATR (Average True Range)
+    this._calculateATR();
+  }
+  
+  /**
+   * Calculate Average True Range (ATR)
+   * @private
+   */
+  _calculateATR() {
+    const period = this.ohlcConfig.atrPeriod;
+    if (this.ohlcData.length < period + 1) return;
+    
+    const trueRanges = [];
+    for (let i = 1; i < this.ohlcData.length; i++) {
+      const current = this.ohlcData[i];
+      const previous = this.ohlcData[i - 1];
+      
+      const tr = Math.max(
+        Math.abs(current.high - current.low),
+        Math.abs(current.high - previous.close),
+        Math.abs(current.low - previous.close)
+      );
+      trueRanges.push(tr);
+    }
+    
+    // Calculate ATR as SMA of true ranges
+    if (trueRanges.length >= period) {
+      const recentTRs = trueRanges.slice(-period);
+      const atr = recentTRs.reduce((sum, tr) => sum + tr, 0) / period;
+      this.volatilityMetrics.atr = atr;
+    }
+  }
+  
+  /**
+   * Detect current volatility regime based on metrics
+   * @private
+   */
+  _detectVolatilityRegime() {
+    const vol = this.volatilityMetrics.volatility;
+    const thresholds = this.ohlcConfig.regimeThresholds;
+    
+    if (vol < thresholds.low) {
+      this.volatilityMetrics.regime = 'low';
+    } else if (vol < thresholds.normal) {
+      this.volatilityMetrics.regime = 'normal';
+    } else if (vol < thresholds.high) {
+      this.volatilityMetrics.regime = 'high';
+    } else {
+      this.volatilityMetrics.regime = 'extreme';
+    }
+    
+    this.logger.info('[TDE] Volatility regime detected', {
+      volatility: vol.toFixed(6),
+      regime: this.volatilityMetrics.regime,
+      atr: this.volatilityMetrics.atr.toFixed(2)
+    });
+  }
+
+  /**
+   * Get mid price from market data using PriceProvider
+   * @private
+   * @param {Object} marketData - Market data containing orderBook and ticker
+   * @returns {number} - Mid price
+   */
+  _getMidPrice(marketData) {
+    // Use PriceProvider for robust midpoint calculation with fallbacks
+    const priceInfo = this.priceProvider.getCurrentPriceInfo({
+      ticker: marketData.ticker,
+      orderBook: marketData.orderBook,
+      useBuffer: true
+    });
+    
+    if (priceInfo.price) {
+      this.logger.debug('Mid price from PriceProvider:', {
+        midPrice: priceInfo.price,
+        source: priceInfo.source,
+        bid: priceInfo.bid,
+        ask: priceInfo.ask,
+        spread: priceInfo.spread
+      });
+      return priceInfo.price;
+    }
+    
+    // Last resort fallback - should rarely be needed with PriceProvider
+    this.logger.warn('PriceProvider could not determine midprice, using last trade price fallback');
+    const lastPrice = parseFloat(marketData.ticker?.last) || 0;
+    return lastPrice;
+  }
+
+  /**
+   * Calculate spread in basis points
+   * @private
+   * @param {Object} orderBook - Order book data
+   * @returns {number} - Spread in basis points
+   */
+  _calculateSpreadBps(orderBook) {
+    const bestBid = orderBook.bids[0]?.[0] || 0;
+    const bestAsk = orderBook.asks[0]?.[0] || 0;
+    if (!bestBid || !bestAsk) return Infinity;
+    return ((bestAsk - bestBid) / bestBid) * 10000; // Convert to basis points
+  }
+
+  /**
+   * Calculate volatility based on recent price history
+   * @private
+   * @returns {number} - Volatility as a decimal
+   */
+  _calculateVolatility() {
+    if (this.priceHistory.length < 2) return 0;
+    const prices = this.priceHistory.slice(-10); // Use last 10 prices
+    const returns = [];
+    
+    for (let i = 1; i < prices.length; i++) {
+      returns.push((prices[i] - prices[i-1]) / prices[i-1]);
+    }
+    
+    const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
+    const variance = returns.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / returns.length;
+    return Math.sqrt(variance);
+  }
+
+  /**
+   * Determine market direction based on ticker data
+   * @private
+   * @param {Object} ticker - Ticker data
+   * @returns {string} - Market direction ('up', 'down', 'sideways')
+   */
+  _determineMarketDirection(ticker) {
+    // Add a check for ticker and its properties
+    if (!ticker || typeof ticker.last !== 'number' || typeof ticker.open !== 'number') {
+      this.logger.warn('[TDE:_determineMarketDirection] Ticker data incomplete or unavailable. Defaulting to sideways.', { ticker });
+      return 'sideways';
+    }
+    const priceChange = ticker.last - ticker.open;
+    if (Math.abs(priceChange) < ticker.open * 0.001) return 'sideways'; // Threshold for sideways
+    return priceChange > 0 ? 'up' : 'down';
+  }
+
+  /**
+   * Determine buy signal based on market conditions
+   * @private
+   * @param {number} spread - Raw spread value
+   * @param {number} price - Current market price
+   * @param {number} volatility - Market volatility
+   * @param {string} marketDirection - Market direction ('up', 'down', 'flat')
+   * @returns {string} Buy signal ('FAVORABLE', 'NEUTRAL', 'AVOID', 'NONE')
+   */
+  _determineBuySignal(spread, price, volatility, marketDirection) {
+    // Calculate relative spread (as percentage of price) for threshold comparisons
+    const relativeSpread = price > 0 ? (spread / price) * 100 : 0;
+    
+    // If spread is too wide, avoid buying
+    if (relativeSpread > this.thresholds.maxSpreadPct) return 'NONE';
+    
+    // Use OHLC-based volatility regime if available
+    const hasVolatilityData = this.ohlcData.length >= this.ohlcConfig.volatilityPeriod;
+    const regime = hasVolatilityData ? this.volatilityMetrics.regime : 'unknown';
+    
+    // Adjust trading based on volatility regime
+    if (regime === 'extreme') {
+      // Don't trade in extreme volatility
+      this.logger.info('[TDE] Avoiding trade due to extreme volatility regime');
+      return 'NONE';
+    } else if (regime === 'high') {
+      // Be more conservative in high volatility
+      if (relativeSpread > this.thresholds.maxSpreadPct * 0.5) return 'NONE';
+    }
+    
+    // Don't trade if historical volatility is too high
+    if (volatility > this.thresholds.highVolatility) return 'NONE';
+    
+    // Don't trade in strong downtrend
+    if (marketDirection === 'down' && this.marketState.isDowntrend) return 'NONE';
+    
+    // Aggressive buy on tight spreads and stable/up market
+    if (spread < this.thresholds.minSpread && marketDirection !== 'down') {
+      // Extra aggressive in low volatility regime
+      if (regime === 'low') {
+        return 'AGGRESSIVE';
+      }
+      return 'OPPORTUNISTIC';
+    }
+    
+    // Default to opportunistic
+    return 'OPPORTUNISTIC';
+  }
+
+  /**
+   * Calculate markup based on market conditions
+   * @param {number} spread - Raw spread value
+   * @param {number} price - Current market price
+   * @param {number} volatility - Market volatility
+   * @param {string} marketDirection - Market direction ('up', 'down', 'flat')
+   * @returns {number} Markup percentage (0.0 - 1.0)
+   */
+  _calculateMarkup(spread, price, volatility, marketDirection) {
+    // Base markup is small multiple of the spread
+    let markup = spread / 2; // Start with half the spread
+    
+    // Convert spread to relative percentage for threshold comparisons
+    const relativeSpread = price > 0 ? (spread / price) * 100 : 0;
+    
+    // Adjust for spread using raw spread values
+    if (spread < this.thresholds.minSpread) {
+      markup *= 0.8; // Tighter markup on tight spreads
+    } else if (spread > this.thresholds.maxSpread / 2) {
+      markup *= 1.5; // Wider markup on wide spreads
+    }
+    
+    // Adjust for volatility
+    if (volatility > 0) {
+      markup += volatility * 0.5; // Add half of the volatility to markup
+    }
+    
+    // Adjust for market direction
+    if (marketDirection === 'up') {
+      markup *= 1.2; // More aggressive markup in uptrend
+    } else if (marketDirection === 'down') {
+      markup *= 0.8; // More conservative markup in downtrend
+    }
+    
+    return markup;
+  }
+  /**
+   * Create a new TradingDecisionEngine
+   * @param {Object} options - Configuration options
+   * @param {Object} options.memoryManager - Memory manager for efficient data storage
+   * @param {Object} options.logger - Logger instance
+   * @param {string} options.symbol - Trading symbol
+   * @param {boolean} options.forceTrade - Force trading regardless of conditions
+   * @param {Object} options.thresholds - Custom thresholds for decision making
+   * @param {Object} options.pricingStrategyConfig - Pricing strategy configuration.
+   */
+  constructor(options = {}) {
+    super();
+    this.logger = options.logger || new TradingLogger('TDE', { level: 'info' }); // Fallback logger
+
+    // Validate required risk parameters
+    if (!options.riskParams) {
+      throw new Error('Risk parameters are required');
+    }
+
+    const requiredRiskParams = [
+      'maxPositionSize',
+      'maxDrawdown',
+      'maxLeverage',
+      'maxExposurePercent',
+      'perTradeRiskPercent',
+      'stopLossPercentage'
+    ];
+
+    const missingParams = requiredRiskParams.filter(param => !options.riskParams[param]);
+    if (missingParams.length > 0) {
+      throw new Error(`Missing required risk parameters: ${missingParams.join(', ')}`);
+    }
+
+    // Store risk parameters without defaults
+    this.riskParams = options.riskParams;
+
+    // === SIMPLIFIED DEBUG LOG ===
+    const obbm = options.orderBookBufferManager;
+    const obbmType = typeof obbm;
+    const hasMethod = obbm ? typeof obbm.getLatestOrderbook === 'function' : false;
+    this.logger.debug('[TDE_CONSTRUCTOR_OBBM_CHECK]', {
+        optionsHasObbmKey: options.hasOwnProperty('orderBookBufferManager'),
+        obbmIsPresent: !!obbm,
+        obbmType: obbmType,
+        hasGetLatestOrderbookMethod: hasMethod
+    });
+    // === END SIMPLIFIED DEBUG LOG ===
+
+    this.orderBookBufferManager = options.orderBookBufferManager; // Store OBBM instance
+    if (!this.orderBookBufferManager) {
+      // This is a critical dependency for the new design.
+      const errorMsg = '[TDE CONSTRUCTOR] CRITICAL: OrderBookBufferManager instance is required but was not provided.';
+      this.logger.error(errorMsg);
+      throw new Error(errorMsg); 
+    }
+
+    // Initialize PriceProvider - create one if not provided
+    this.priceProvider = options.priceProvider || new PriceProvider({
+      logger: this.logger.createChild('PriceProvider'),
+      symbol: options.symbol || 'BTC/USD',
+      bufferSize: options.priceProviderBufferSize || 100,
+      bufferTimeWindow: options.priceProviderTimeWindow || 250,
+      memoryManager: options.memoryManager
+    });
+    this.logger.info('PriceProvider initialized', { 
+      provided: !!options.priceProvider,
+      symbol: this.priceProvider.symbol 
+    });
+
+    this.forceTrade = options.forceTradingEnabled || options.forceTrade || false; 
+    this.tradingDirection = options.tradingDirection || 'both'; 
+    this.logger.debug('[TDE_CONSTRUCTOR_DEBUG] TDE instance properties set:', { 
+      instance_forceTrade: this.forceTrade,
+      instance_tradingDirection: this.tradingDirection
+    });
+
+    // Initialize basic properties first
+    this.memoryManager = options.memoryManager;
+    this.symbol = options.symbol || 'BTC/USD';
+    this.debug = options.debug || false;
+    
+    // Initialize OHLC data storage and volatility tracking
+    this.ohlcData = [];
+    this.volatilityMetrics = {
+      atr: 0,          // Average True Range
+      volatility: 0,   // Standard deviation of returns
+      regime: 'normal' // 'low', 'normal', 'high'
+    };
+    this.ohlcConfig = {
+      maxCandles: 200,           // Keep last 200 candles
+      volatilityPeriod: 20,      // Period for volatility calculation
+      atrPeriod: 14,             // Period for ATR calculation
+      regimeThresholds: {
+        low: 0.005,              // < 0.5% volatility
+        normal: 0.015,           // 0.5% - 1.5% volatility
+        high: 0.025              // > 2.5% volatility
+      }
+    };
+
+    // CRITICAL: Validate exchange configuration is provided
+    if (!options.exchangeConfig) {
+      const errorMsg = `[TDE] CRITICAL: Exchange configuration is required but not provided. Cannot proceed without proper configuration.`;
+      this.logger.error(errorMsg);
+      throw new Error(errorMsg);
+    }
+
+    // Validate exchange configuration has required fields
+    if (!options.exchangeConfig.pairDetails || !options.exchangeConfig.pairDetails.minVolumeForPair) {
+      const errorMsg = `[TDE] CRITICAL: Exchange configuration must include pairDetails.minVolumeForPair. Cannot proceed without proper configuration.`;
+      this.logger.error(errorMsg, { providedConfig: JSON.stringify(options.exchangeConfig) });
+      throw new Error(errorMsg);
+    }
+
+    // Initialize exchange configuration - NO DEFAULTS
+    this.exchangeConfig = options.exchangeConfig;
+    this.logger.info('TradingDecisionEngine initialized with exchangeConfig:', { exchangeConfig: JSON.stringify(this.exchangeConfig) });
+
+    // Default configurations
+    // Calculate dynamic trade size based on trading pair minimum with safety buffer
+    const tradingPairMinVolume = this.exchangeConfig.pairDetails.minVolumeForPair;
+    
+    if (!tradingPairMinVolume || tradingPairMinVolume <= 0) {
+      const errorMsg = `[TDE] CRITICAL: Trading pair minimum volume not available or invalid for ${this.symbol}. Value: ${tradingPairMinVolume}. Cannot proceed without proper configuration.`;
+      this.logger.error(errorMsg);
+      throw new Error(errorMsg);
+    }
+    
+    const safetyBuffer = 1.5; // 50% above minimum to ensure orders aren't rejected
+    const calculatedDefaultSize = tradingPairMinVolume * safetyBuffer;
+    
+    // Use calculated size if provided size is at or below the minimum (not safe enough)
+    this.defaultTradeSize = options.defaultTradeSize && options.defaultTradeSize > tradingPairMinVolume 
+      ? options.defaultTradeSize 
+      : calculatedDefaultSize;
+    
+    this.logger.info('TradingDecisionEngine trade size configuration', {
+      tradingPair: this.symbol,
+      tradingPairMinVolume,
+      safetyBuffer,
+      providedDefaultTradeSize: options.defaultTradeSize,
+      calculatedDefaultSize,
+      finalDefaultTradeSize: this.defaultTradeSize,
+      source: options.defaultTradeSize && options.defaultTradeSize > tradingPairMinVolume ? 'provided' : 'calculated',
+      reasoning: options.defaultTradeSize && options.defaultTradeSize > tradingPairMinVolume 
+        ? 'provided size is above minimum'
+        : 'provided size at/below minimum, using calculated safe size',
+      // Enhanced logging for SOL/USD debugging
+      isSOL: this.symbol?.includes('SOL'),
+      expectedMinimumForSOL: this.symbol?.includes('SOL') ? 0.02 : 'N/A'
+    });
+
+    // Initialize pricing strategy configuration
+    this.pricingStrategyConfig = validateAndNormalizePricingStrategyConfig(options.pricingStrategyConfig);
+    this.logger.debug('Pricing strategy configuration initialized', { pricingStrategyConfig: JSON.stringify(this.pricingStrategyConfig) });
+
+    // Initialize actual exchange fee rates (can be updated later)
+    this.actualExchangeFeeRates = { maker: null, taker: null, lastUpdated: null };
+
+    // Initialize Pricing Engine
+    this.pricingEngine = new PricingEngine({
+      pricingStrategyConfig: this.pricingStrategyConfig,
+      actualFeeRates: this.actualExchangeFeeRates, // Pass initial (possibly null) rates
+      logger: this.logger.createChild('PricingEngine')
+    });
+
+    // Initialize spread calculator
+    this.spreadCalculator = new SpreadCalculator({
+      logger: options.logger,
+      debug: this.debug,
+      maxSpread: options.thresholds?.maxSpreadBps / 10000 || 0.02 // Convert bps to decimal
+    });
+    
+    // Parse the trading pair to get base and quote currencies
+    const [base, quote] = (this.symbol || '').split('/');
+    this.baseCurrency = base;
+    this.quoteCurrency = quote;
+    
+    // Configuration for trading direction
+    // 'buy-only': Only make buy recommendations (default for standard market maker)
+    // 'sell-only': Only make sell recommendations
+    // 'both': Make both buy and sell recommendations
+    this.logger.debug('Trading direction configured', { tradingDirection: this.tradingDirection });
+    
+    // Initialize risk engine or use provided one
+    if (options.riskEngine) {
+      this.riskEngine = options.riskEngine;
+      this.logger.debug('Using provided risk engine');
+    } else {
+      // Initialize our own risk engine
+      this.riskEngine = new RiskEngine({
+        logger: this.logger.createChild('RiskEngine'),
+        symbol: this.symbol,
+        riskParams: options.riskParams || {
+          maxPositionSize: options.maxPositionSize || 0.01, // Default 0.01 BTC
+          maxDrawdown: options.maxDrawdown || 0.05, // Default 5%
+          maxLeverage: options.maxLeverage || 1.0, // Default no leverage
+          maxExposurePercent: options.maxExposurePercent || 0.5, // Default 50% of balance
+          perTradeRiskPercent: options.perTradeRiskPercent || 0.02 // Default 2% of portfolio per trade
+        },
+        memoryManager: this.memoryManager,
+        ...(options.riskStrategy && { strategyName: options.riskStrategy })
+      });
+      this.logger.info('Initialized risk engine', {
+        strategy: this.riskEngine.riskStrategy?.getName() || 'default',
+        maxPositionSize: this.riskEngine.riskParams.maxPositionSize,
+        maxDrawdown: this.riskEngine.riskParams.maxDrawdown,
+        perTradeRiskPercent: this.riskEngine.riskParams.perTradeRiskPercent
+      });
+    }
+    
+    // Define thresholds using raw spread values
+    this.thresholds = {
+      // Spread thresholds (now in raw values, not basis points)
+      minSpread: options.thresholds?.minSpread || 0, // Minimum raw spread (now set to 0)
+      maxSpread: options.thresholds?.maxSpread || 5.0, // Maximum raw spread
+      
+      // Volatility threshold
+      highVolatility: options.thresholds?.highVolatility || 0.005, // 0.5% price movement
+      
+      // Change detection thresholds
+      significantSpreadChange: options.thresholds?.significantSpreadChange || 0.2, // 20% change
+      significantPriceChange: options.thresholds?.significantPriceChange || 0.005, // 0.5% change
+      
+      // Order book imbalance threshold
+      maxImbalance: options.thresholds?.maxImbalance || 0.7, // 70% imbalance
+      maxImbalanceRatio: options.thresholds?.maxImbalanceRatio || 2.0, // Assuming a threshold like 2.0 for strong bid imbalance
+      downtrend: {
+        '1m': options.thresholds?.downtrend1m || 0.001,
+        '5m': options.thresholds?.downtrend5m || 0.005,
+        '15m': options.thresholds?.downtrend15m || 0.01
+      },
+      maxSpreadPct: options.thresholds?.maxSpreadPct || 0.05, // 5% spread as a percentage of price
+      minNetProfitPercentage: options.thresholds?.minNetProfitPercentage || 0.001 // Default to 0.1%
+    };
+    
+    // Data buffers
+    this.priceHistory = [];
+    this.spreadHistory = [];
+    this.volumeHistory = [];
+    
+    // Maximum buffer sizes
+    this.maxBufferSize = {
+      price: 10000, // Keep up to 1000 price points
+      spread: 10000,  // Keep up to 100 spread measurements
+      volume: 5000   // Keep up to 500 volume records
+    };
+    
+    // Timeframes for analysis in milliseconds
+    this.timeframes = {
+      '1m': 60 * 1000,
+      '5m': 5 * 60 * 1000,
+      '15m': 15 * 60 * 1000
+    };
+    
+    // Track market state
+    this.marketState = {
+      currentSpread: null,
+      lastSpread: null,
+      currentPrice: null,
+      lastPrice: null,
+      spreadTrend: 'stable', // 'widening', 'narrowing', 'stable'
+      priceTrend: 'sideways', // 'up', 'down', 'sideways'
+      imbalance: 0,
+      volatility: 0,
+      isDowntrend: false,
+      lastUpdateTime: Date.now(),
+      consecutiveDowntrends: 0,
+      significantEvents: [],
+      // Order size statistics
+      orderSizeStats: {
+        bid: {
+          average: 0,
+          median: 0,
+          total: 0,
+          count: 0
+        },
+        ask: {
+          average: 0,
+          median: 0,
+          total: 0,
+          count: 0
+        }
+      }
+    };
+    
+    // Decision state
+    this.lastDecision = {
+      shouldTrade: true,
+      buySignal: 'NEUTRAL',
+      sellSignal: 'NEUTRAL',
+      timestamp: Date.now(),
+      reason: 'Initial state'
+    };
+    
+    this.logger.info('TradingDecisionEngine initialized', {
+      forceTrade: this.forceTrade,
+      symbol: this.symbol
+    });
+
+    // Make _getBestSignal overridable for testing
+    this._getBestSignalFn = this._getBestSignalInternal;
+  }
+  
+  // Actual internal implementation
+  _getBestSignalInternal(currentPrice, buyPriceSignalParam, sellPriceSignalParam, currentPositionNet, memory) {
+    this.logger.debug('Called _getBestSignalInternal with restored logic', { currentPrice });
+
+    const validPrice = this.marketState.currentPrice || currentPrice || 0;
+    // let spreadPercentage = this.marketState.currentSpread || 0; // Raw spread, not percentage
+    // const volatility = this._calculateVolatility(); // Already in marketState
+    // const marketDirection = this.marketState.priceTrend || 'sideways'; // Already in marketState
+
+    let internalBuySignal = 'NEUTRAL'; // Default internal signal states
+    let internalSellSignal = 'NEUTRAL';
+    let signalReason = 'Market conditions within acceptable ranges'; // For debugging/logging if needed
+
+    // 1. Check for valid price (essential for any decision)
+    if (validPrice <= 0) {
+      this.logger.debug('_getBestSignalInternal: No valid price, returning NONE', { validPrice });
+      return 'NONE'; // Cannot make a signal without a valid price
+    }
+
+    // 2. Check for downtrend influence
+    if (this.marketState.isDowntrend) {
+      internalBuySignal = 'AVOID';
+      internalSellSignal = 'AGGRESSIVE';
+      signalReason = 'Market in downtrend';
+      if (this.marketState.consecutiveDowntrends > 2) {
+        this.logger.debug('_getBestSignalInternal: Extended downtrend, returning NONE', {
+          consecutiveDowntrends: this.marketState.consecutiveDowntrends
+        });
+        return 'NONE'; // Pause trading in extended downtrend
+      }
+    }
+
+    // 3. Check price trend influence (if not in a hard downtrend avoidance)
+    if (this.marketState.priceTrend === 'up' && internalBuySignal !== 'AVOID') {
+      internalBuySignal = 'FAVORABLE';
+      signalReason = 'Market in uptrend';
+    } else if (this.marketState.priceTrend === 'down' && internalSellSignal !== 'AVOID') {
+      // If already aggressive from downtrend, this doesn't change it further
+      // but if it was NEUTRAL, can become more favorable for selling.
+      if (internalSellSignal === 'NEUTRAL') internalSellSignal = 'FAVORABLE'; 
+      // signalReason = 'Market in slight downtrend (but not isDowntrend)'; // More nuanced reason
+    }
+
+    // 4. Consider order size statistics (order book imbalance)
+    const bidStats = this.marketState.orderSizeStats?.bid;
+    const askStats = this.marketState.orderSizeStats?.ask;
+
+    if (bidStats && bidStats.median > 0 && askStats && askStats.median > 0) {
+      const bidAskMedianRatio = bidStats.median / askStats.median;
+      if (bidAskMedianRatio > (this.thresholds.maxImbalanceRatio || 2.0)) { // Assuming a threshold like 2.0 for strong bid imbalance
+        if (internalSellSignal !== 'AVOID') internalSellSignal = 'FAVORABLE'; // Good to sell into buying pressure
+        this.logger.debug('_getBestSignalInternal: Large median bid sizes detected', { bidAskMedianRatio });
+        // signalReason += `, size imbalance ratio (bid heavy): ${bidAskMedianRatio.toFixed(2)}`;
+      } else if (bidAskMedianRatio < (1 / (this.thresholds.maxImbalanceRatio || 2.0))) { // Assuming threshold like 0.5 for strong ask imbalance
+        if (internalBuySignal !== 'AVOID') internalBuySignal = 'FAVORABLE'; // Good to buy into selling pressure
+        this.logger.debug('_getBestSignalInternal: Large median ask sizes detected', { bidAskMedianRatio });
+        // signalReason += `, size imbalance ratio (ask heavy): ${bidAskMedianRatio.toFixed(2)}`;
+      }
+    }
+    
+    // 5. Use other basic conditions from _determineBuySignal (simplified)
+    // Example: if spread is too wide (using marketState.currentSpread which should be a percentage here)
+    if (this.marketState.currentSpread > (this.thresholds.maxSpreadPct * 100)) { // Compare percentage with percentage
+        this.logger.debug('_getBestSignalInternal: Spread too wide, AVOIDING trades', { 
+            currentSpreadPct: this.marketState.currentSpread, 
+            maxSpreadPct: this.thresholds.maxSpreadPct * 100 
+        });
+        return 'NONE';
+    }
+    if (this.marketState.volatility > this.thresholds.highVolatility) {
+        this.logger.debug('_getBestSignalInternal: Volatility too high, AVOIDING trades', { volatility: this.marketState.volatility, highVolatility: this.thresholds.highVolatility });
+        return 'NONE';
+    }
+
+    // Final signal determination based on internalBuySignal/internalSellSignal and tradingDirection
+    this.logger.debug('_getBestSignalInternal: Evaluated internal signals', { internalBuySignal, internalSellSignal, tradingDirection: this.tradingDirection, signalReason });
+
+    if (this.tradingDirection === 'buy-only') {
+      if (internalBuySignal === 'FAVORABLE' || internalBuySignal === 'AGGRESSIVE') return 'BUY';
+    } else if (this.tradingDirection === 'sell-only') {
+      if (internalSellSignal === 'FAVORABLE' || internalSellSignal === 'AGGRESSIVE') return 'SELL';
+    } else { // 'both'
+      if (internalBuySignal === 'FAVORABLE' || internalBuySignal === 'AGGRESSIVE') return 'BUY';
+      if (internalSellSignal === 'FAVORABLE' || internalSellSignal === 'AGGRESSIVE') return 'SELL';
+    }
+    
+    return 'NONE'; // Default if no strong signal aligns with trading direction
+  }
+
+  // Wrapper called by _makeDecision
+  _getBestSignal(currentPrice, buyPriceSignal, sellPriceSignal, currentPositionNet, memory) {
+    return this._getBestSignalFn(currentPrice, buyPriceSignal, sellPriceSignal, currentPositionNet, memory);
+  }
+  
+  /**
+   * Process new orderbook data
+   * @param {Object} orderBook - Order book data
+   * @param {number} timestamp - Timestamp of the data
+   * @returns {boolean} - True if this update triggered a new decision
+   */
+  processOrderBook(orderBook, timestamp = Date.now()) {
+    // Log the raw orderBook received
+    this.logger.info('[TDE:processOrderBook] Received order book:', {
+      orderBook: JSON.stringify(orderBook),
+      timestamp
+    });
+
+    if (!orderBook || !orderBook.bids || !orderBook.asks) {
+      this.logger.warn('[TDE:processOrderBook] Invalid orderbook data received, not processing.', { orderBookProvided: !!orderBook });
+      return false;
+    }
+    
+    try {
+      // Store orderbook in memory manager if available
+      if (this.memoryManager) {
+        const key = `orderbook:${this.symbol}:${timestamp}`;
+        this.memoryManager.addOrderbook(key, orderBook);
+      }
+      
+      // Extract top of book data
+      const topBid = orderBook.bids && orderBook.bids.length > 0 ? parseFloat(orderBook.bids[0][0]) : 0;
+      const topAsk = orderBook.asks && orderBook.asks.length > 0 ? parseFloat(orderBook.asks[0][0]) : 0;
+      
+      // Skip invalid data
+      if (topBid <= 0 || topAsk <= 0) {
+        this.logger.warn('[TDE:processOrderBook] Invalid top bid/ask prices, not processing further.', { topBid, topAsk });
+        return false;
+      }
+      
+      // Calculate metrics
+      const midPrice = (topBid + topAsk) / 2;
+      const spread = topAsk - topBid; // Raw spread value
+      
+      // Update market state with orderbook data
+      // Calculate spread as percentage of price
+      const spreadPercentage = (spread / midPrice) * 100;
+      
+      this.logger.debug('Updating market state with order book data', {
+        topBid,
+        topAsk,
+        midPrice,
+        rawSpread: spread,
+        spreadPercentage: spreadPercentage
+      });
+      
+      // Only update if we have valid values
+      if (spread > 0) {
+        const spreadChanged = this._hasSpreadChangedSignificantly(spreadPercentage);
+        const priceChanged = this._hasPriceChangedSignificantly(midPrice);
+        this.spreadHistory.shift();
+      }
+      
+      // Calculate orderbook imbalance (ratio of total bid volume to total ask volume)
+      const bidVolume = this._calculateSideVolume(orderBook.bids);
+      const askVolume = this._calculateSideVolume(orderBook.asks);
+      const totalVolume = bidVolume + askVolume;
+      const imbalance = totalVolume > 0 ? Math.abs((bidVolume - askVolume) / totalVolume) : 0;
+      
+      // Calculate order size statistics
+      const bidSizeStats = this._calculateOrderSizeStats(orderBook.bids);
+      const askSizeStats = this._calculateOrderSizeStats(orderBook.asks);
+      
+      // Check if spread has changed significantly
+      const spreadChanged = this._hasSpreadChangedSignificantly(spreadPercentage);
+      
+      // Check if price has changed significantly
+      const priceChanged = this._hasPriceChangedSignificantly(midPrice);
+      
+      // Update market state
+      this.marketState.lastSpread = this.marketState.currentSpread;
+      this.marketState.currentSpread = spreadPercentage;
+      this.marketState.lastPrice = this.marketState.currentPrice;
+      this.marketState.currentPrice = midPrice;
+      this.marketState.imbalance = imbalance;
+      this.marketState.lastUpdateTime = timestamp;
+      
+      // Update order size statistics
+      this.marketState.orderSizeStats.bid = bidSizeStats;
+      this.marketState.orderSizeStats.ask = askSizeStats;
+      
+      // Determine spread trend
+      if (this.marketState.lastSpread !== null) {
+        if (spreadPercentage > this.marketState.lastSpread * (1 + this.thresholds.significantSpreadChange)) {
+          this.marketState.spreadTrend = 'widening';
+        } else if (spreadPercentage < this.marketState.lastSpread * (1 - this.thresholds.significantSpreadChange)) {
+          this.marketState.spreadTrend = 'narrowing';
+        } else {
+          this.marketState.spreadTrend = 'stable';
+        }
+      }
+      
+      // Determine price trend
+      if (this.marketState.lastPrice !== null) {
+        const priceChange = (midPrice - this.marketState.lastPrice) / this.marketState.lastPrice;
+        if (priceChange > this.thresholds.significantPriceChange) {
+          this.marketState.priceTrend = 'up';
+        } else if (priceChange < -this.thresholds.significantPriceChange) {
+          this.marketState.priceTrend = 'down';
+        } else {
+          this.marketState.priceTrend = 'sideways';
+        }
+      }
+      
+      // Check for downtrend
+      this.marketState.isDowntrend = this._isMarketInDowntrend();
+      
+      // Update volatility measurement
+      this.marketState.volatility = this._calculateVolatility();
+      
+      // Track significant events
+      if (spreadChanged || priceChanged) {
+        this.marketState.significantEvents.push({
+          timestamp,
+          type: spreadChanged ? 'SPREAD_CHANGE' : 'PRICE_CHANGE',
+          value: spreadChanged ? spreadPercentage : midPrice,
+          previousValue: spreadChanged ? this.marketState.lastSpread : this.marketState.lastPrice
+        });
+        
+        // Limit events buffer
+        if (this.marketState.significantEvents.length > 20) {
+          this.marketState.significantEvents.shift();
+        }
+        
+      // Generate new trading decision on significant changes
+      // Construct a marketData object for _makeDecision, using the orderBook from processOrderBook
+      const internalMarketData = {
+        orderBook: orderBook 
+        // _makeDecision will use this.marketState for other properties like midPrice if not found here
+        // and has fallbacks for ticker or averagedOrderbook if they are essential and missing.
+      };
+      // Pass stored position and balance data if available
+      this._makeDecision(internalMarketData, this.currentPositionInfo, this.currentBalances);
+      this.emit('decision', this.lastDecision);
+      return true;
+      }
+      
+      return false;
+    } catch (error) {
+      this.logger.error('[TDE:processOrderBook] Error processing orderbook', {
+        error: error.message,
+        stack: error.stack,
+        orderBook: JSON.stringify(orderBook) // Log the problematic orderbook
+      });
+      return false;
+    }
+  }
+  
+  /**
+   * Process new trade data
+   * @param {Object} trade - Trade data
+   */
+  processTrade(trade) {
+    try {
+      // Add to volume history
+      this.volumeHistory.push({
+        timestamp: trade.timestamp || Date.now(),
+        price: trade.price,
+        volume: trade.volume,
+        side: trade.side
+      });
+      
+      // Limit buffer size
+      if (this.volumeHistory.length > this.maxBufferSize.volume) {
+        this.volumeHistory.shift();
+      }
+    } catch (error) {
+      this.logger.error('Error processing trade', {
+        error: error.message
+      });
+    }
+  }
+  
+  /**
+   * Analyze market and make trading decision
+   * @param {Object} position - Current position data (optional)
+   * @param {Object} balances - Current balance data (optional)
+   * @returns {Object} - Trading decision with risk constraints applied
+   */
+  makeDecision(position = null, balances = null) { // marketData parameter removed
+    this.logger.debug('[TDE:makeDecision] Invoked', { hasPosition: !!position, hasBalances: !!balances });
+    
+    // Log inputs (now simpler)
+    this.logger.info('[TDE:makeDecision] INPUTS:', {
+      position: JSON.stringify(position),
+      balances: JSON.stringify(balances)
+    });
+
+    // Fetch market data using OrderBookBufferManager
+    const orderBook = this.orderBookBufferManager ? this.orderBookBufferManager.getLatestOrderbook() : null;
+    const averagedMetrics = this.orderBookBufferManager ? this.orderBookBufferManager.calculateAveragedMetrics() : null;
+
+    this.logger.error('[TDE:makeDecision DEBUG_OBBM_OUTPUT]', { // .error for visibility
+      rawOrderBookFromOBBM: orderBook ? JSON.stringify(orderBook) : 'null',
+      rawAveragedMetricsFromOBBM: averagedMetrics ? JSON.stringify(averagedMetrics) : 'null'
+    });
+
+    if (!orderBook || !averagedMetrics || !orderBook.bids || !orderBook.asks || orderBook.bids.length === 0 || orderBook.asks.length === 0) {
+      this.logger.warn('[TDE:makeDecision] Insufficient market data from OrderBookBufferManager for decision making.');
+      const decision = {
+        action: 'HOLD',
+        shouldTrade: false,
+        reason: 'Insufficient market data from OBBM'
+      };
+      this.lastDecision = { ...decision }; this.emit('decision', this.lastDecision);
+      return decision;
+    }
+
+    // Construct ticker data (addressing the 'open' issue temporarily)
+    const ticker = {
+      bid: averagedMetrics.bestBid,
+      ask: averagedMetrics.bestAsk,
+      last: averagedMetrics.midPrice,
+      open: averagedMetrics.midPrice, // TEMPORARY: Use midPrice as open for _determineMarketDirection
+      timestamp: averagedMetrics.timestamp || Date.now()
+    };
+    this.logger.debug('[TDE:makeDecision] Constructed ticker from OBBM metrics:', { ticker: JSON.stringify(ticker) });
+
+    // The marketData object is now constructed internally
+    const currentMarketData = {
+      orderBook,
+      ticker,
+      averagedMetrics, // Include this if _makeDecision or other methods need more than just ticker/orderBook
+      // Pass currentBudget and currentPositions if TDE needs them directly from AMMv2.
+      // For now, _makeDecision will primarily use the orderBook and ticker.
+      // If risk engine or other parts of TDE need budget/positions not derived from marketData,
+      // they might need to be passed into makeDecision (like position and balances currently are).
+      currentBudget: balances ? balances[this.quoteCurrency]?.available : null, // Example
+      currentPositions: position ? position.netPosition : null // Example
+    };
+    
+    this.currentMarketData = currentMarketData; // For compatibility if any other internal methods used this directly
+    this.currentPositionInfo = position;
+    this.currentBalances = balances;
+
+    // Validate orderbook data integrity (already partially done by OBBM, but good to double check top level)
+    const bestBid = parseFloat(orderBook.bids[0][0]);
+    const bestAsk = parseFloat(orderBook.asks[0][0]);
+    
+    if (isNaN(bestBid) || isNaN(bestAsk) || bestBid <= 0 || bestAsk <= 0) {
+      const errorMsg = `[TDE:makeDecision] Invalid top bid/ask from OBBM: bestBid=${bestBid}, bestAsk=${bestAsk}`;
+      this.logger.error(errorMsg);
+      const decision = { action: 'HOLD', shouldTrade: false, reason: 'Invalid top bid/ask from OBBM' };
+      this.lastDecision = { ...decision }; this.emit('decision', this.lastDecision);
+      return decision;
+    }
+    
+    const midPrice = (bestBid + bestAsk) / 2;
+    const currentSpread = bestAsk - bestBid;
+    
+    if (isNaN(midPrice) || midPrice <= 0 || isNaN(currentSpread) || currentSpread < 0) {
+      const errorMsg = `[TDE:makeDecision] Invalid calculated midPrice/spread from OBBM data: midPrice=${midPrice}, spread=${currentSpread}`;
+      this.logger.error(errorMsg);
+      const decision = { action: 'HOLD', shouldTrade: false, reason: 'Invalid midPrice/spread from OBBM data' };
+      this.lastDecision = { ...decision }; this.emit('decision', this.lastDecision);
+      return decision;
+    }
+    
+    // Update TDE's internal marketState (simplified, as OBBM/PriceProvider does heavy lifting)
+    this.marketState.currentPrice = midPrice;
+    this.marketState.currentSpread = currentSpread; // Raw spread
+    this.logger.info('[TDE:makeDecision] Spread calculation input:', { bestBid, bestAsk });
+    this.marketState.currentSpreadBps = this.spreadCalculator.calculateSpreadBps(bestBid, bestAsk);
+    this.logger.info('[TDE:makeDecision] Spread calculation result:', { currentSpreadBps: this.marketState.currentSpreadBps });
+    this.marketState.priceTrend = this._determineMarketDirection(ticker); // Uses the new ticker
+    this.marketState.volatility = this._calculateVolatility(); // Assumes priceHistory is still managed or adapted
+
+    // Generate the trading decision using our comprehensive _makeDecision method
+    // _makeDecision now uses this.currentMarketData internally
+    const decision = this._makeDecision(this.currentMarketData, position, balances); 
+    
+    // Apply risk constraints if available
+    // The risk engine might need direct access to balances/positions or they are passed via _makeDecision
+    const riskConstrainedDecision = this.applyRiskConstraints(decision, position, balances, midPrice);
+    
+    this.lastDecision = { ...riskConstrainedDecision };
+    this.emit('decision', this.lastDecision);
+    this.logger.info('[TDE:makeDecision OUTPUT]', { finalDecision: JSON.stringify(this.lastDecision) });
+    return this.lastDecision;
+  }
+  
+  /**
+   * Check if the market is in a downtrend
+   * @private
+   * @returns {boolean} - True if market is in a downtrend
+   */
+  _isMarketInDowntrend() {
+    try {
+      // Check if we have enough price history
+      if (this.priceHistory.length < 10) {
+        return false;
+      }
+      
+      const now = Date.now();
+      
+      // Check different timeframes
+      const timeframeResults = {};
+      
+      // 1-minute analysis
+      timeframeResults['1m'] = this._isTimeframeInDowntrend('1m', now);
+      
+      // 5-minute analysis if we have enough data
+      if (this.priceHistory.length >= 30) {
+        timeframeResults['5m'] = this._isTimeframeInDowntrend('5m', now);
+      }
+      
+      // 15-minute analysis if we have enough data
+      if (this.priceHistory.length >= 90) {
+        timeframeResults['15m'] = this._isTimeframeInDowntrend('15m', now);
+      }
+      
+      // Market is in downtrend if any timeframe shows a downtrend
+      const isDowntrend = Object.values(timeframeResults).some(result => result);
+      
+      // Update consecutive downtrend counter
+      if (isDowntrend) {
+        this.marketState.consecutiveDowntrends++;
+      } else {
+        // Reset counter if no downtrend is detected
+        this.marketState.consecutiveDowntrends = 0;
+      }
+      
+      return isDowntrend;
+    } catch (error) {
+      this.logger.error('Error detecting downtrend', {
+        error: error.message
+      });
+      return false;
+    }
+  }
+  
+  /**
+   * Check if a specific timeframe is in a downtrend
+   * @private
+   * @param {string} timeframe - Timeframe to check ('1m', '5m', '15m')
+   * @param {number} currentTime - Current timestamp
+   * @returns {boolean} - True if timeframe is in a downtrend
+   */
+  _isTimeframeInDowntrend(timeframe, currentTime) {
+    // Get timeframe duration in ms
+    const duration = this.timeframes[timeframe];
+    if (!duration) return false;
+    
+    // Filter price history to this timeframe
+    const timeframePrices = this.priceHistory.filter(p => 
+      p.timestamp >= currentTime - duration
+    ).map(p => p.price);
+    
+    // Need at least a few price points
+    if (timeframePrices.length < 3) return false;
+    
+    // Calculate percentage change from start to end
+    const startPrice = timeframePrices[0];
+    const endPrice = timeframePrices[timeframePrices.length - 1];
+    const percentChange = (endPrice - startPrice) / startPrice;
+    
+    // Check against threshold for this timeframe
+    return percentChange < this.thresholds.downtrend[timeframe];
+  }
+  
+  /**
+   * Check if we have an open position based on the current positions data
+   * @private
+   * @param {Object} position - Current position data passed to makeDecision
+   * @returns {boolean} - True if we have an open position
+   */
+  _hasOpenPosition(position) {
+    // Check if we have position data
+    if (!position) {
+      return false;
+    }
+    
+    // If position is an array, check if any position has non-zero size
+    if (Array.isArray(position)) {
+      return position.some(pos => pos && pos.size && Math.abs(pos.size) > 0);
+    }
+    
+    // If position is an object, check if it has non-zero size
+    if (position.size && Math.abs(position.size) > 0) {
+      return true;
+    }
+    
+    // Check alternative position formats
+    if (position.amount && Math.abs(position.amount) > 0) {
+      return true;
+    }
+    
+    if (position.quantity && Math.abs(position.quantity) > 0) {
+      return true;
+    }
+    
+    return false;
+  }
+
+  /**
+   * Calculate volatility over recent price history
+   * @private
+   * @returns {number} - Volatility as decimal (e.g., 0.015 = 1.5%)
+   */
+  _calculateVolatility() {
+    // Need enough price history
+    if (this.priceHistory.length < 10) return 0;
+    
+    // Use the last 10 price points
+    const recentPrices = this.priceHistory.slice(-10).map(p => p.price);
+    
+    // Calculate standard deviation
+    const mean = recentPrices.reduce((sum, price) => sum + price, 0) / recentPrices.length;
+    const squaredDiffs = recentPrices.map(price => Math.pow(price - mean, 2));
+    const variance = squaredDiffs.reduce((sum, diff) => sum + diff, 0) / squaredDiffs.length;
+    const stdDev = Math.sqrt(variance);
+    
+    // Normalize by mean price to get coefficient of variation (relative volatility)
+    return mean > 0 ? stdDev / mean : 0;
+  }
+  
+  /**
+   * Calculate total volume for one side of the orderbook
+   * @private
+   * @param {Array} side - One side of the orderbook (bids or asks)
+   * @returns {number} - Total volume
+   */
+  _calculateSideVolume(side) {
+    if (!side || !Array.isArray(side)) return 0;
+    
+    return side.reduce((total, level) => {
+      // Orderbook format is typically [price, volume] for each level
+      const volume = parseFloat(level[1]);
+      return isNaN(volume) ? total : total + volume;
+    }, 0);
+  }
+  
+  /**
+   * Calculate order size statistics for one side of the orderbook
+   * @private
+   * @param {Array} side - One side of the orderbook (bids or asks)
+   * @returns {Object} - Statistics including average, median, total, count
+   */
+  _calculateOrderSizeStats(side) {
+    if (!side || !Array.isArray(side) || side.length === 0) {
+      return { average: 0, median: 0, total: 0, count: 0 };
+    }
+    
+    try {
+      // Extract all volumes
+      const volumes = side.map(level => {
+        const volume = parseFloat(level[1]);
+        return isNaN(volume) ? 0 : volume;
+      }).filter(vol => vol > 0); // Filter out zero or invalid volumes
+      
+      if (volumes.length === 0) {
+        return { average: 0, median: 0, total: 0, count: 0 };
+      }
+      
+      // Calculate total volume
+      const total = volumes.reduce((sum, vol) => sum + vol, 0);
+      
+      // Calculate average
+      const average = total / volumes.length;
+      
+      // Calculate median
+      // Sort volumes in ascending order
+      const sortedVolumes = [...volumes].sort((a, b) => a - b);
+      let median;
+      
+      const midIndex = Math.floor(sortedVolumes.length / 2);
+      if (sortedVolumes.length % 2 === 0) {
+        // Even number of elements - average the two middle values
+        median = (sortedVolumes[midIndex - 1] + sortedVolumes[midIndex]) / 2;
+      } else {
+        // Odd number of elements - take the middle value
+        median = sortedVolumes[midIndex];
+      }
+      
+      return {
+        average,
+        median,
+        total,
+        count: volumes.length
+      };
+    } catch (error) {
+      this.logger.error('Error calculating order size statistics', {
+        error: error.message
+      });
+      return { average: 0, median: 0, total: 0, count: 0 };
+    }
+  }
+  
+  /**
+   * Determine which side of the orderbook has more volume
+   * @private
+   * @returns {string} - 'BID_DOMINANT' or 'ASK_DOMINANT'
+   */
+  _getBidAskImbalanceDirection() {
+    const latestOrderBook = this.memoryManager?.getOrderbook(`orderbook:${this.symbol}:latest`);
+    
+    if (!latestOrderBook) return 'BALANCED';
+    
+    const bidVolume = this._calculateSideVolume(latestOrderBook.bids);
+    const askVolume = this._calculateSideVolume(latestOrderBook.asks);
+    
+    return bidVolume > askVolume ? 'BID_DOMINANT' : 'ASK_DOMINANT';
+  }
+  
+  /**
+   * Check if spread has changed significantly
+   * @private
+   * @param {number} currentSpreadBps - Current spread in basis points
+   * @returns {boolean} - True if spread has changed significantly
+   */
+  _hasSpreadChangedSignificantly(currentSpreadBps) {
+    // Need a previous spread to compare
+    if (this.marketState.currentSpread === null) return false;
+    
+    const prevSpread = this.marketState.currentSpread;
+    const changeRatio = Math.abs((currentSpreadBps - prevSpread) / prevSpread);
+    
+    return changeRatio > this.thresholds.significantSpreadChange;
+  }
+  
+  /**
+   * Check if price has changed significantly
+   * @private
+   * @param {number} currentPrice - Current mid price
+   * @returns {boolean} - True if price has changed significantly
+   */
+  _hasPriceChangedSignificantly(currentPrice) {
+    // Need a previous price to compare
+    if (this.marketState.currentPrice === null) return false;
+    
+    const prevPrice = this.marketState.currentPrice;
+    const changeRatio = Math.abs((currentPrice - prevPrice) / prevPrice);
+    
+    return changeRatio > this.thresholds.significantPriceChange;
+  }
+  
+  /**
+   * Get the current market state
+   * @returns {Object} - Current market state
+   */
+  getMarketState() {
+    return { ...this.marketState };
+  }
+  
+  /**
+   * Get the last trading decision
+   * @returns {Object} - Last trading decision
+   */
+  getLastDecision() {
+    return { ...this.lastDecision };
+  }
+  
+  /**
+   * Applies precision to a number
+   * @private
+   * @param {Number} num - Number to apply precision to
+   * @param {Number} precision - Decimal places to keep
+   * @returns {Number} - Number with applied precision
+   */
+  _applyPrecision(num, precision) {
+    if (typeof num !== 'number' || isNaN(num) || typeof precision !== 'number' || isNaN(precision) || precision < 0) {
+      this.logger.warn('[TDE:_applyPrecision] Invalid input for _applyPrecision', { num, precision });
+      // Return num as is or handle error appropriately, e.g., return NaN or throw error
+      return num; 
+    }
+    const factor = Math.pow(10, precision);
+    // Use Math.trunc for potentially better behavior with negative numbers if that's a concern,
+    // but Math.floor is standard for this kind of precision application.
+    return Math.floor(num * factor) / factor;
+  }
+  
+  /**
+   * Apply risk constraints to a trading decision
+   * 
+   * @param {Object} decision - Trading decision from market analysis
+   * @param {Object} position - Current position data
+   * @param {Object} balances - Current balance data
+   * @param {number} currentPrice - Current market price
+   * @returns {Object} - Trading decision with risk constraints applied
+   */
+  applyRiskConstraints(decision, position, balances, currentPrice, { riskParams = this.riskEngine?.riskParams, exchangeConfig = this.exchangeConfig } = {}) {
+    const initialDecisionSize = decision.size; // Original intended size
+    let shouldTrade = decision.shouldTrade;
+    let decisionAction = decision.action;
+    let adjustedSize = decision.size || this.defaultTradeSize;
+    let decisionReason = decision.reason || 'Initial decision';
+
+    this.logger.debug('[TDE:applyRiskConstraints] ENTRY:', { 
+      initialDecision: JSON.stringify(decision), 
+      forceTrade: this.forceTrade,
+      tradingMode: this.tradingMode,
+      paperTrading: this.paperTrading
+    });
+
+    try {
+      // 1. Get and validate constraints from RiskEngine
+      if (!this.riskEngine || typeof this.riskEngine.getTradingConstraints !== 'function') {
+        this.logger.error('[TDE:applyRiskConstraints] RiskEngine or getTradingConstraints unavailable.');
+        return { ...decision, riskConstrained: false, reason: decisionReason + ' - Risk engine unavailable.' };
+      }
+      const rawConstraints = this.riskEngine.getTradingConstraints(position, balances, currentPrice, { 
+        decision, 
+        exchangeConfig,
+        forceTrade: this.forceTrade,
+        forceTrading: this.forceTrade,
+        paperTrading: this.paperTrading || this.tradingMode === 'paper',
+        tradingMode: this.tradingMode,
+        volatility: decision.volatility || 0.01
+      });
+      this.logger.debug('[TDE:applyRiskConstraints] Raw constraints:', { rawConstraints });
+      if (!rawConstraints) {
+        this.logger.error('[TDE:applyRiskConstraints] RiskEngine returned null/undefined constraints.');
+        return { ...decision, riskConstrained: false, reason: decisionReason + ' - Null constraints from risk engine.' };
+      }
+
+      const {
+        canOpenNewPositions = true,
+        maxOrderSize: constraintsMaxOrderSize = Infinity,
+        maxPositionSize: constraintsMaxPositionSize = Infinity,
+        stopLossPrice: constraintsStopLossPrice,
+        takeProfitPrice: constraintsTakeProfitPrice,
+        riskMetrics = {},
+      } = rawConstraints;
+
+      this.logger.debug('[TDE:applyRiskConstraints] Effective constraints:', { canOpenNewPositions, constraintsMaxOrderSize, constraintsMaxPositionSize, constraintsStopLossPrice, constraintsTakeProfitPrice });
+
+      if (typeof constraintsMaxOrderSize !== 'number' || isNaN(constraintsMaxOrderSize) || typeof constraintsMaxPositionSize !== 'number' || isNaN(constraintsMaxPositionSize)) {
+        this.logger.error('[TDE:applyRiskConstraints] Invalid numeric values for maxOrderSize/maxPositionSize.', { constraintsMaxOrderSize, constraintsMaxPositionSize });
+        return { ...decision, riskConstrained: false, reason: decisionReason + ' - Invalid risk constraint values.' };
+      }
+
+      // 2. Calculate portfolio-based max trade size and the overall risk-adjusted max size
+      const portfolioValue = this.quoteCurrency && balances[this.quoteCurrency] ? balances[this.quoteCurrency].available : 0;
+      const resolvedRiskParams = riskParams; // Already resolved from args or this.riskParams
+      
+      // Use relaxed risk parameters for force trading mode (matching DefaultRiskStrategy logic)
+      const isForceTradingMode = this.forceTrade || this.paperTrading || this.tradingMode === 'paper';
+      const riskPercent = isForceTradingMode ? 0.10 : (resolvedRiskParams.perTradeRiskPercent || 0.02); // 10% for force trading, 2% for normal
+      
+      this.logger.debug('[TDE:applyRiskConstraints] Risk calculation parameters', {
+        isForceTradingMode,
+        riskPercent,
+        portfolioValue,
+        forceTrade: this.forceTrade,
+        paperTrading: this.paperTrading,
+        tradingMode: this.tradingMode
+      });
+      
+      const maxRiskAmount = portfolioValue * riskPercent;
+      const sizePrecision = exchangeConfig?.pairDetails?.sizePrecision;
+      const maxTradeSizeFromPortfolioPct = (currentPrice > 0 && typeof sizePrecision === 'number' && !isNaN(sizePrecision))
+        ? this._applyPrecision(maxRiskAmount / currentPrice, sizePrecision)
+        : 0;
+      
+      const overallRiskAdjustedCap = Math.min(constraintsMaxOrderSize, maxTradeSizeFromPortfolioPct);
+
+      this.logger.debug('[TDE:applyRiskConstraints] Risk-adjusted sizing:', { 
+        maxRiskAmount, 
+        maxTradeSizeFromPortfolioPct, 
+        overallRiskAdjustedCap,
+        originalSize: adjustedSize
+      });
+
+      // 3. Apply position size constraints
+      if (!canOpenNewPositions) {
+        if (isForceTradingMode) {
+          this.logger.warn('[TDE:applyRiskConstraints] Risk engine says cannot open new positions, but force trading enabled. Allowing trade.');
+        } else {
+          this.logger.info('[TDE:applyRiskConstraints] Cannot open new positions per risk constraints.');
+          shouldTrade = false; decisionAction = 'HOLD'; adjustedSize = 0;
+          decisionReason += ' - Cannot open new positions.';
+        }
+      }
+
+      // 4. Apply size constraints (but relax for force trading)
+      if (shouldTrade && overallRiskAdjustedCap > 0 && adjustedSize > overallRiskAdjustedCap) {
+        if (isForceTradingMode) {
+          // In force trading mode, use a minimum viable size instead of blocking
+          const pairMinVolume = exchangeConfig?.pairDetails?.minVolumeForPair || 0.001;
+          const minViableSize = pairMinVolume * 1.1; // 10% above minimum to ensure acceptance
+          adjustedSize = Math.max(minViableSize, Math.min(adjustedSize, overallRiskAdjustedCap));
+          this.logger.info(`[TDE:applyRiskConstraints] Force trading: Adjusted size from ${initialDecisionSize} to ${adjustedSize} due to risk cap.`, {
+            pairMinVolume,
+            minViableSize,
+            overallRiskAdjustedCap,
+            originalSize: initialDecisionSize,
+            finalSize: adjustedSize
+          });
+          decisionReason += ` - Force trade size adjusted to ${adjustedSize}.`;
+        } else {
+          this.logger.info(`[TDE:applyRiskConstraints] Size ${adjustedSize} exceeds risk-adjusted cap ${overallRiskAdjustedCap}. Converting to HOLD.`);
+          shouldTrade = false; decisionAction = 'HOLD'; adjustedSize = 0;
+          decisionReason += ` - Size exceeds risk cap ${overallRiskAdjustedCap}.`;
+        }
+      }
+      
+      // 5. Budget Check (CRITICAL: Always enforce budget, even in force trading mode)
+      if (shouldTrade && decisionAction === 'BUY') {
+        const requiredQuote = adjustedSize * (decision.price || currentPrice);
+        if (portfolioValue < requiredQuote) {
+          if (isForceTradingMode && this.tradingMode === 'paper') {
+            // In force trading mode, reduce order size to fit budget instead of bypassing
+            const maxAffordableSize = portfolioValue / (decision.price || currentPrice);
+            const reducedSize = maxAffordableSize * 0.95; // Use 95% of available
+            
+            if (reducedSize > 0 && portfolioValue >= (reducedSize * (decision.price || currentPrice))) {
+              adjustedSize = reducedSize;
+              this.logger.info(`[TDE:applyRiskConstraints] Force trading mode: Reduced order size to fit budget. Original: ${decision.size}, Adjusted: ${adjustedSize}, Available: ${portfolioValue}`);
+              decisionReason += ` - Force trade size reduced to fit budget (${adjustedSize}).`;
+            } else {
+              this.logger.info(`[TDE:applyRiskConstraints] Force trading mode: Insufficient budget for any meaningful order. Have ${portfolioValue}. Converting to HOLD.`);
+              shouldTrade = false; decisionAction = 'HOLD'; adjustedSize = 0;
+              decisionReason += ' - Force trade blocked: insufficient budget.';
+            }
+          } else {
+            this.logger.info(`[TDE:applyRiskConstraints] Insufficient quote balance for BUY. Have ${portfolioValue}, need ${requiredQuote}. Converting to HOLD.`);
+            shouldTrade = false; decisionAction = 'HOLD'; adjustedSize = 0;
+            decisionReason += ' - Insufficient quote balance.';
+          }
+        }
+      } else if (shouldTrade && decisionAction === 'SELL') {
+        const baseCurrency = this.baseCurrency;
+        const availableBase = balances[baseCurrency]?.available || 0;
+        if (availableBase < adjustedSize) {
+          if (isForceTradingMode && this.tradingMode === 'paper') {
+            // In force trading mode, reduce sell size to available balance
+            const maxAvailableSize = availableBase * 0.95; // Use 95% of available
+            
+            if (maxAvailableSize > 0) {
+              adjustedSize = maxAvailableSize;
+              this.logger.info(`[TDE:applyRiskConstraints] Force trading mode: Reduced SELL size to available balance. Original: ${decision.size}, Adjusted: ${adjustedSize}, Available: ${availableBase}`);
+              decisionReason += ` - Force trade SELL size reduced to available (${adjustedSize}).`;
+            } else {
+              this.logger.info(`[TDE:applyRiskConstraints] Force trading mode: Insufficient base balance for any SELL order. Have ${availableBase}. Converting to HOLD.`);
+              shouldTrade = false; decisionAction = 'HOLD'; adjustedSize = 0;
+              decisionReason += ' - Force trade SELL blocked: insufficient base balance.';
+            }
+          } else {
+            this.logger.info(`[TDE:applyRiskConstraints] Insufficient base balance for SELL. Have ${availableBase}, need ${adjustedSize}. Converting to HOLD.`);
+            shouldTrade = false; decisionAction = 'HOLD'; adjustedSize = 0;
+            decisionReason += ' - Insufficient base balance.';
+          }
+        }
+      }
+
+      // Apply final size
+      const finalDecision = {
+        ...decision,
+        action: decisionAction,
+        shouldTrade,
+        size: adjustedSize,
+        reason: decisionReason,
+        riskConstrained: true,
+        appliedConstraints: {
+          maxOrderSize: constraintsMaxOrderSize,
+          maxPositionSize: constraintsMaxPositionSize,
+          portfolioRiskPercent: riskPercent,
+          isForceTradingMode
+        }
+      };
+
+      this.logger.info('[TDE:applyRiskConstraints] RESULT:', { 
+        originalShouldTrade: decision.shouldTrade,
+        finalShouldTrade: shouldTrade,
+        originalSize: initialDecisionSize,
+        finalSize: adjustedSize,
+        reason: decisionReason,
+        isForceTradingMode
+      });
+
+      return finalDecision;
+
+    } catch (error) {
+      this.logger.error('[TDE:applyRiskConstraints] CRITICAL ERROR:', { errorMessage: error.message, stack: error.stack });
+      return { ...decision, riskConstrained: false, reason: decisionReason + ' - Risk constraint error.' };
+    }
+  }
+  
+  /**
+   * Reset all buffers and state
+   */
+  reset() {
+    this.priceHistory = [];
+    this.spreadHistory = [];
+    this.volumeHistory = [];
+    
+    this.marketState = {
+      currentSpread: null,
+      lastSpread: null,
+      currentPrice: null,
+      lastPrice: null,
+      spreadTrend: 'stable',
+      priceTrend: 'sideways',
+      imbalance: 0,
+      volatility: 0,
+      isDowntrend: false,
+      lastUpdateTime: Date.now(),
+      consecutiveDowntrends: 0,
+      significantEvents: []
+    };
+    
+    this.lastDecision = {
+      shouldTrade: true,
+      buySignal: 'NEUTRAL',
+      sellSignal: 'NEUTRAL',
+      timestamp: Date.now(),
+      reason: 'State reset'
+    };
+    
+    this.logger.info('TradingDecisionEngine reset');
+  }
+  
+  /**
+   * Update configuration parameters
+   * @param {Object} config - New configuration
+   */
+  updateConfig(config) {
+    if (config.forceTrade !== undefined) {
+      this.forceTrade = config.forceTrade;
+    }
+    
+    if (config.thresholds) {
+      this.thresholds = {
+        ...this.thresholds,
+        ...config.thresholds
+      };
+    }
+    
+    this.logger.info('TradingDecisionEngine configuration updated', {
+      forceTrade: this.forceTrade
+    });
+  }
+
+  /**
+   * Update the actual exchange fee rates
+   * @param {Object} feeRates - Object containing maker and taker fee rates
+   * @param {number} feeRates.maker - Maker fee rate as decimal (e.g., 0.0016 for 0.16%)
+   * @param {number} feeRates.taker - Taker fee rate as decimal (e.g., 0.0026 for 0.26%)
+   */
+  updateActualFeeRates(feeRates) {
+    if (feeRates && (feeRates.maker !== undefined || feeRates.taker !== undefined)) {
+      this.actualExchangeFeeRates.maker = feeRates.maker ?? this.actualExchangeFeeRates.maker;
+      this.actualExchangeFeeRates.taker = feeRates.taker ?? this.actualExchangeFeeRates.taker;
+      this.actualExchangeFeeRates.lastUpdated = Date.now();
+      
+      // Update the PricingEngine with the new rates
+      this.pricingEngine.updateActualFeeRates(this.actualExchangeFeeRates);
+      
+      this.logger.info('[TDE] Actual exchange fee rates updated.', { 
+        maker: this.actualExchangeFeeRates.maker, 
+        taker: this.actualExchangeFeeRates.taker 
+      });
+    } else {
+      this.logger.warn('[TDE] Attempted to update fee rates with invalid data.', { feeRates });
+    }
+  }
+
+  /**
+   * Internal method to generate trading decision
+   * @private
+   * @param {Object} marketData - Market data (passed from makeDecision, might be null)
+   * @returns {Object} - Trading decision
+   */
+  _makeDecision(marketData, position = null, balances = null) { // Position & balances can still be passed if needed by risk or specific logic
+    const startTime = Date.now();
+    
+    // marketData is now sourced internally by the public makeDecision via OBBM
+    // So, the marketData parameter here is what was constructed in the public makeDecision
+    this.logger.info('[TDE:_makeDecision] INPUTS (data sourced via OBBM by public makeDecision):', {
+      marketData_is_present: !!marketData,
+      marketData_has_orderBook: !!(marketData && marketData.orderBook),
+      marketData_has_ticker: !!(marketData && marketData.ticker),
+      marketData_has_averagedMetrics: !!(marketData && marketData.averagedMetrics),
+      position: JSON.stringify(position),
+      balances: JSON.stringify(balances),
+      instance_forceTrade: this.forceTrade, // Use instance property
+      instance_tradingDirection: this.tradingDirection // Use instance property
+    });
+
+    let decision = {
+      action: 'HOLD',
+      reason: 'Default - no action criteria met',
+      shouldTrade: false,
+      size: this.defaultTradeSize,
+      buyPrice: null,
+      sellPrice: null,
+      price: null,
+    };
+
+    if (!marketData || !marketData.orderBook || !marketData.ticker || !marketData.averagedMetrics) {
+      this.logger.warn('[TDE:_makeDecision] Internally sourced market data (orderBook, ticker, or metrics) is unavailable.');
+      decision.reason = 'Internally sourced market data unavailable';
+      // this.lastDecision already set by public makeDecision if this happens, but good to be explicit
+      this.emit('decision', { ...decision }); return decision; 
+    }
+
+    const { orderBook, ticker, averagedMetrics } = marketData;
+    // const midPrice = this._getMidPrice(marketData); // Already in averagedMetrics.midPrice
+    const midPrice = averagedMetrics.midPrice;
+
+    this.logger.error('[TDE:_makeDecision DEBUG_METRICS_RECEIVED]', { // .error for visibility
+      avgMetrics_midPrice: midPrice,
+      avgMetrics_bestBid: averagedMetrics.bestBid,
+      avgMetrics_bestAsk: averagedMetrics.bestAsk,
+      avgMetrics_spread: averagedMetrics.spread, // Also log the spread if it exists on averagedMetrics
+      ticker_open: ticker?.open // Check what open price is being used
+    });
+
+    if (isNaN(midPrice) || midPrice <= 0) {
+      this.logger.warn('[TDE:_makeDecision] Invalid midPrice from averagedMetrics.', { midPrice });
+      decision.reason = 'Invalid midPrice from averagedMetrics';
+      this.emit('decision', { ...decision }); return decision;
+    }
+
+    // const bestBid = parseFloat(orderBook.bids[0]?.[0]) || midPrice; // From averagedMetrics
+    // const bestAsk = parseFloat(orderBook.asks[0]?.[0]) || midPrice; // From averagedMetrics
+    const bestBid = averagedMetrics.bestBid;
+    const bestAsk = averagedMetrics.bestAsk;
+    
+    let spread = bestAsk - bestBid;
+    if (spread <= 0 && ticker?.ask && ticker?.bid) {
+        const tickerAsk = parseFloat(ticker.ask);
+        const tickerBid = parseFloat(ticker.bid);
+        if (tickerAsk > tickerBid) spread = tickerAsk - tickerBid;
+    }
+    if (spread < 0) spread = 0;
+
+    this.logger.error('[TDE:_makeDecision DEBUG_SPREAD_CALC_VALUES]', { // .error for visibility
+      bestBid_for_spread: bestBid,
+      bestAsk_for_spread: bestAsk,
+      calculated_spread_value: spread
+    });
+
+    this.marketState.currentMidPrice = midPrice;
+    this.marketState.currentSpread = spread;
+    this.logger.error('[TDE:_makeDecision DEBUG_SPREAD_CALCULATOR_INPUT]', { // .error for visibility
+        bestBid_to_SpreadCalculator: bestBid,
+        bestAsk_to_SpreadCalculator: bestAsk
+    });
+    this.marketState.currentSpreadBps = this.spreadCalculator.calculateSpreadBps(bestBid, bestAsk);
+    this.marketState.priceTrend = this._determineMarketDirection(ticker);
+
+    // --- Calculate strategic prices using PricingEngine ---
+    this.logger.info('[TDE:_makeDecision] PricingEngine BUY input:', { side: 'buy', midPrice, spread });
+    this.logger.error('[TDE:_makeDecision DEBUG_PRICING_ENGINE_BUY_INPUT]', { // .error for visibility
+        side: 'buy',
+        midPrice_to_PricingEngine: midPrice,
+        spread_to_PricingEngine: spread
+    });
+    const strategicBuyPrice = this.pricingEngine.calculateGrossOrderPrice({
+      side: 'buy', midPrice, spread
+    });
+    this.logger.info('[TDE:_makeDecision] PricingEngine BUY output:', { strategicBuyPrice });
+
+    // TDE is BUY-ONLY for market making
+    // Sell orders are created by TakeProfitService after buy fills
+    this.logger.info('[TDE:_makeDecision] TDE is BUY-ONLY - sells handled by TakeProfitService after buy fills');
+
+    const currentActualPrice = midPrice;
+    const positionNet = position?.currentPosition;
+    const signalMemory = this.memoryManager ? this.memoryManager.getMemory('tradingSignals') : undefined;
+
+    const decisionSignal = this._getBestSignalFn(
+      currentActualPrice,
+      strategicBuyPrice, 
+      null, // No sell price needed - TDE is buy-only
+      positionNet,
+      signalMemory
+    );
+
+    // Use default trade size (no volatility-based sizing)
+    const tradeSize = this.defaultTradeSize;
+    const hasVolatilityData = this.ohlcData.length >= this.ohlcConfig.volatilityPeriod;
+    const regime = hasVolatilityData ? this.volatilityMetrics.regime : 'unknown';
+    
+    if (!hasVolatilityData) {
+      this.logger.info('[TDE] No volatility data available yet', {
+        ohlcCandles: this.ohlcData.length,
+        requiredCandles: this.ohlcConfig.volatilityPeriod,
+        regime: 'unknown',
+        tradeSize: this.defaultTradeSize
+      });
+    }
+    
+    // Log volatility metrics with decision
+    this.logger.info('[TDE] Volatility analysis for decision', {
+      regime: this.volatilityMetrics.regime,
+      volatility: this.volatilityMetrics.volatility?.toFixed(6),
+      atr: this.volatilityMetrics.atr?.toFixed(2),
+      ohlcDataAvailable: this.ohlcData.length > 0,
+      candleCount: this.ohlcData.length
+    });
+
+    if (decisionSignal === 'BUY') {
+      this.logger.info(`[TDE:_makeDecision] BUY signal received. Mid: ${midPrice}, StrategicBuy: ${strategicBuyPrice}`);
+      if (strategicBuyPrice && strategicBuyPrice > 0 && tradeSize > 0) {
+        const buyFeeDetails = this.pricingEngine.getEstimatedFeeDetails({
+          side: 'buy', grossOrderPrice: strategicBuyPrice, amount: tradeSize, orderType: 'limit'
+        });
+        const projectedTpSellPrice = this.pricingEngine.calculateGrossOrderPrice({
+          side: 'sell', entryPrice: strategicBuyPrice, midPrice: midPrice, spread: spread, isTakeProfit: true
+        });
+
+        if (projectedTpSellPrice && projectedTpSellPrice > 0) {
+          const sellFeeDetails = this.pricingEngine.getEstimatedFeeDetails({
+            side: 'sell', grossOrderPrice: projectedTpSellPrice, amount: tradeSize, orderType: 'limit'
+          });
+
+          const costOfBuy = strategicBuyPrice * tradeSize + (buyFeeDetails?.feeAmount || 0);
+          const revenueFromSell = projectedTpSellPrice * tradeSize - (sellFeeDetails?.feeAmount || 0);
+          const netPnl = revenueFromSell - costOfBuy;
+          const netPnlPercentage = (costOfBuy > 0) ? (netPnl / costOfBuy) * 100 : 0;
+          const minNetProfitTarget = this.thresholds?.minNetProfitPercentage || 0.01;
+
+          this.logger.debug('[TDE:_makeDecision] BUY P&L Check:', {
+            strategicBuyPrice, tradeSize, buyFee: buyFeeDetails?.feeAmount,
+            projectedTpSellPrice, sellFee: sellFeeDetails?.feeAmount,
+            netPnl, netPnlPercentage, minNetProfitTarget
+          });
+
+          if (netPnlPercentage >= minNetProfitTarget) {
+            decision.action = 'BUY';
+            decision.shouldTrade = true;
+            decision.price = strategicBuyPrice;
+            decision.buyPrice = strategicBuyPrice; // Set buyPrice for compatibility
+            decision.size = tradeSize;
+            decision.reason = `BUY signal, P&L target ${minNetProfitTarget}% met (${netPnlPercentage.toFixed(4)}%) [Vol: ${regime}]`;
+            decision.volatilityRegime = regime;
+            decision.volatility = this.volatilityMetrics.volatility;
+          } else {
+            decision.reason = `BUY signal, P&L target ${minNetProfitTarget}% NOT met (${netPnlPercentage.toFixed(4)}%). Holding. [Vol: ${regime}]`;
+          }
+        } else {
+          decision.reason = 'BUY signal, but could not project TP sell price for P&L check. Holding.';
+        }
+      } else {
+        decision.reason = 'BUY signal, but invalid strategic buy price or size. Holding.';
+      }
+    } else if (decisionSignal === 'SELL') {
+      this.logger.info(`[TDE:_makeDecision] SELL signal received but ignored - TDE is BUY-ONLY. TakeProfitService handles sells.`);
+      decision.reason = 'SELL signal ignored - TDE is BUY-ONLY. TakeProfitService handles sells after buy fills.';
+    } else {
+      decision.reason = `${decisionSignal || 'NONE'}. SpreadBps: ${this.marketState.currentSpreadBps?.toFixed(2)}. Holding. [Vol: ${regime}]`;
+      decision.volatilityRegime = regime;
+      decision.volatility = this.volatilityMetrics.volatility;
+    }
+
+    // Handle forceTrade (using this.forceTrade and this.tradingDirection from instance)
+    if (this.forceTrade) {
+      let forcedAction = null;
+      const currentSignalAction = decision.action;
+      this.logger.info('[TDE:_makeDecision] Force trading evaluation started.', {
+        currentDecisionBeforeForce: JSON.stringify(decision),
+        instance_tradingDirection: this.tradingDirection, // Log instance property
+        decisionSignal
+      });
+      
+      // TDE is BUY-ONLY - force trading can only create BUY actions
+      if (this.tradingDirection === 'buy-only' || this.tradingDirection === 'both') {
+        if (decisionSignal === 'BUY') {
+          forcedAction = 'BUY';
+        } else if (decisionSignal === 'SELL') {
+          // TDE cannot create sell orders - ignore SELL signals in force trading
+          this.logger.info('[TDE:_makeDecision] SELL signal ignored in force trading - TDE is BUY-ONLY');
+          forcedAction = null;
+        } else {
+          // For adaptive market maker: only buy when no position
+          // The sell orders will be created automatically by take-profit logic when buy orders fill
+          const hasOpenPosition = this._hasOpenPosition(position);
+          
+          if (this.pricingStrategyConfig?.buy && this.pricingStrategyConfig?.sell) {
+            if (hasOpenPosition) {
+              // We have a position, so we should NOT force any action
+              // Let the take-profit logic in AdaptiveMarketMakerV2 handle sell orders
+              forcedAction = null;
+              this.logger.info('[TDE:_makeDecision] Have open position, NOT forcing any action (take-profit will handle sells)', {
+                hasOpenPosition,
+                positionData: position,
+                pricingStrategy: { buy: this.pricingStrategyConfig.buy, sell: this.pricingStrategyConfig.sell }
+              });
+            } else {
+              // No position, so we should only consider buying
+              forcedAction = 'BUY';
+              this.logger.info('[TDE:_makeDecision] No open position, forcing BUY to open position', {
+                hasOpenPosition,
+                pricingStrategy: { buy: this.pricingStrategyConfig.buy, sell: this.pricingStrategyConfig.sell }
+              });
+            }
+          } else {
+            // If no pricing strategy config, default to buy only when no position
+            forcedAction = hasOpenPosition ? null : 'BUY';
+          }
+        }
+            } else if (this.tradingDirection === 'sell-only') {
+        // TDE cannot create sell orders - this configuration is invalid
+        this.logger.warn('[TDE:_makeDecision] Invalid configuration: TDE is BUY-ONLY but tradingDirection is sell-only');
+        forcedAction = null;
+      } else { 
+         forcedAction = 'BUY';
+      }
+
+      if (forcedAction) {
+        const priceForForcedAction = strategicBuyPrice; // TDE is BUY-ONLY
+        this.logger.info('[TDE:_makeDecision] Force trading - priceForForcedAction:', { forcedAction, priceForForcedAction, strategicBuyPrice }); // Log selected price
+        if (priceForForcedAction && priceForForcedAction > 0 && tradeSize > 0) {
+            const reasonBeforeForce = decision.reason;
+            decision.action = forcedAction;
+            decision.shouldTrade = true;
+            decision.price = priceForForcedAction;
+            if (forcedAction === 'BUY') {
+              decision.buyPrice = priceForForcedAction; // Set buyPrice for compatibility
+            }
+            decision.reason = `Force trading enabled (direction: ${this.tradingDirection || 'any'}, signal: ${decisionSignal || 'NONE'}), forced to: ${forcedAction}. Original reason: ${reasonBeforeForce}`;
+            this.logger.info('[TDE:_makeDecision] Force trading active, decision modified.', {
+              forcedAction,
+              price: decision.price,
+              originalReason: reasonBeforeForce,
+              finalDecisionAfterForce: JSON.stringify(decision)
+            });
+        } else {
+            this.logger.warn('[TDE:_makeDecision] Force trading wanted to act, but strategic price invalid.', { forcedAction, priceForForcedAction, currentDecision: JSON.stringify(decision) });
+            decision.shouldTrade = false; 
+            decision.action = 'HOLD';
+            decision.reason += ' - Force trade price invalid.';
+        }
+      }
+    }
+    
+    if (decision.shouldTrade && (!decision.price || decision.price <= 0)) {
+        this.logger.warn('[TDE:_makeDecision] Decision to trade, but final execution price is invalid. Reverting to HOLD.', { currentDecision: decision });
+        decision.action = 'HOLD';
+        decision.shouldTrade = false;
+        decision.price = null;
+        decision.reason += ' - Invalid execution price, converted to HOLD.';
+    }
+
+    // this.lastDecision is now set by the public makeDecision after risk constraints.
+    // this.emit('decision', { ...decision }); // Emit raw decision before risk? Or after? Usually after all processing.
+    const decisionTime = Date.now() - startTime;
+    // Logging of final decision (including risk constraints) is done in public makeDecision
+    this.logger.info(`[TDE:_makeDecision] Raw decision (before risk) completed in ${decisionTime}ms.`, { rawDecision: JSON.stringify(decision) });
+    return decision; // Return the raw decision; risk constraints applied by caller (public makeDecision)
+  }
+}
+
+export default TradingDecisionEngine;

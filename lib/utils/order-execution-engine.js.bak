@@ -1,0 +1,881 @@
+/**
+ * OrderExecutionEngine
+ * 
+ * This component is responsible for executing trading decisions by placing,
+ * modifying, and canceling orders. It works with the AdaptiveMarketMaker to
+ * translate trading decisions into actual orders.
+ * 
+ * Key features:
+ * - Handles order placement through exchange adapters
+ * - Manages order lifecycle (creation, updates, cancellation)
+ * - Validates orders against available balances
+ * - Stores order information in memory manager
+ * - Provides detailed logging of order execution
+ */
+
+import { TradingLogger } from '../../../utils/trading-logger.js';
+import { v4 as uuidv4 } from 'uuid';
+import { OrderStatus } from './order/OrderStatus.js';
+
+class OrderExecutionEngine {
+  /**
+   * Create a new OrderExecutionEngine
+   * @param {Object} options Configuration options
+   * @param {Object} options.exchange Exchange adapter instance
+   * @param {Object} options.logger Logger instance
+   * @param {Object} options.memoryManager Memory manager for storing order data
+   * @param {string} options.symbol Trading symbol (e.g., 'BTC/USD')
+   * @param {string} options.baseCurrency Base currency (e.g., 'BTC')
+   * @param {string} options.quoteCurrency Quote currency (e.g., 'USD')
+   * @param {string} options.sessionId Session ID for tracking
+   * @param {boolean} options.paperTrading Whether using paper trading
+   */
+  constructor(options = {}) {
+    // Set up logger
+    this.logger = options.logger || new TradingLogger({
+      component: 'OrderExecutionEngine',
+      symbol: options.symbol,
+      sessionId: options.sessionId || 'unknown'
+    });
+    
+    // Store configuration
+    this.exchange = options.exchange;
+    this.memoryManager = options.memoryManager;
+    this.symbol = options.symbol;
+    this.baseCurrency = options.baseCurrency;
+    this.quoteCurrency = options.quoteCurrency;
+    this.sessionId = options.sessionId || uuidv4().slice(0, 8);
+    this.paperTrading = options.paperTrading || false;
+    
+    // Performance tracking
+    this.performanceTracker = options.performanceTracker;
+    
+    // Order tracking
+    this.activeOrders = {
+      buy: null,
+      sell: null
+    };
+    
+    // Initialize default balances for paper trading
+    // Only use USD for balance calculations to avoid confusion
+    this.initialBalance = options.initialBalance || 10000;
+    this.defaultBalances = {
+      USD: { available: this.initialBalance, total: this.initialBalance }
+    };
+    
+    // Price and size formatting
+    this.pricePrecision = options.pricePrecision || 2;
+    this.sizePrecision = options.sizePrecision || 6;
+    
+    this.logger.debug('OrderExecutionEngine initialized', {
+      symbol: this.symbol,
+      baseCurrency: this.baseCurrency,
+      quoteCurrency: this.quoteCurrency,
+      paperTrading: this.paperTrading
+    });
+  }
+  
+  /**
+   * Execute orders based on trading decisions
+   * @param {Object} params Parameters for order execution
+   * @param {Object} params.decision Trading decision from TradingDecisionEngine
+   * @param {Object} params.marketData Current market data
+   * @param {Object} params.balances Current balances
+   * @returns {Promise<Object>} Execution results
+   */
+  async executeOrder(params) {
+    let { decision, marketData, balances = null } = params;
+    const startTime = Date.now();
+    
+    // Initialize results
+    const results = {
+      buy: null,
+      sell: null,
+      canceled: [],
+      error: null,
+      executionTime: 0
+    };
+    
+    try {
+      // Retrieve balances from memory manager if not provided
+      if (this.memoryManager) {
+        const balanceKey = 'current_balances';
+        const memoryBalances = this.memoryManager.getBalance(balanceKey);
+        
+        if (memoryBalances) {
+          balances = memoryBalances;
+        }
+        
+        // If balances don't exist or USD is missing, initialize them
+        if (!balances || !balances.USD) {
+          balances = {
+            USD: { total: 10000, available: 10000, reserved: 0 }
+          };
+          this.logger.info('Created default balances for paper trading', {
+            balances: JSON.stringify(balances)
+          });
+          this.memoryManager.addBalance(balanceKey, balances);
+        }
+        
+        // Log the balances for debugging
+        const hasUSD = balances && balances.USD;
+        const USDAvailable = hasUSD ? balances.USD.available : 0;
+        const USDReserved = hasUSD ? balances.USD.reserved : 0;
+        const USDTotal = hasUSD ? balances.USD.total : 0;
+        
+        this.logger.info('Using balance from memory manager', {
+          balance: JSON.stringify(balances),
+          key: balanceKey,
+          hasUSD,
+          USDAvailable,
+          USDReserved,
+          USDTotal
+        });
+      }
+    
+    // Log input parameters
+    this.logger.debug('Starting order execution with params', {
+      decision: JSON.stringify(decision),
+      marketDataPresent: !!marketData,
+      balances: balances ? JSON.stringify(balances) : 'null',
+      symbol: this.symbol
+    });
+    
+    // Add detailed debugging for the decision
+    this.logger.debug('DETAILED ORDER EXECUTION PARAMS', {
+      decision: JSON.stringify(decision),
+      balances: JSON.stringify(balances),
+      marketData: marketData ? 'present' : 'missing',
+      forceTrade: decision.marketConditions?.forceTrade === true,
+      defaultBalances: JSON.stringify(this.defaultBalances)
+    });
+    
+    // Ensure balances have the correct structure
+    if (balances && balances.USD && balances.USD.total === 0 && this.defaultBalances.USD && this.defaultBalances.USD.total > 0) {
+      this.logger.debug('Detected zero USD balance, using default balance', {
+        defaultUsdBalance: this.defaultBalances.USD
+      });
+      balances.USD = { ...this.defaultBalances.USD };
+      
+      // Update the balance in memory manager
+      if (this.memoryManager) {
+        this.memoryManager.addBalance('current_balances', balances);
+        this.logger.debug('Updated balances in memory manager with default USD balance', {
+          updatedBalances: JSON.stringify(balances)
+          this.logger.debug('No balance found in memory manager with key', {
+            key: balanceKey
+          });
+        }
+      } else {
+        this.logger.debug('No memory manager available');
+      }
+      
+      // Use default balances if still null
+      if (!balances) {
+        this.logger.debug('Using default balances', {
+          defaultBalances: JSON.stringify(this.defaultBalances)
+        });
+        balances = this.defaultBalances;
+        
+        // Store default balances in memory manager for future use
+        if (this.memoryManager) {
+          const balanceKey = 'current_balances';
+          this.memoryManager.addBalance(balanceKey, balances);
+          this.logger.debug('Stored default balances in memory manager', {
+            key: balanceKey,
+            balances: JSON.stringify(balances)
+          });
+          
+          // Verify the balances were stored correctly
+          const verifiedBalances = this.memoryManager.getBalance(balanceKey);
+          this.logger.debug('Verified balances in memory manager', {
+            success: !!verifiedBalances,
+            balances: verifiedBalances ? JSON.stringify(verifiedBalances) : 'null'
+          });
+        }
+      }
+      
+      // Add detailed debugging for the decision
+      this.logger.debug('DETAILED ORDER EXECUTION PARAMS', {
+        decision: JSON.stringify(decision),
+        balances: JSON.stringify(balances),
+        marketData: marketData ? 'present' : 'missing',
+        forceTrade: decision.marketConditions?.forceTrade === true,
+        defaultBalances: JSON.stringify(this.defaultBalances)
+      });
+      
+      // Ensure balances have the correct structure
+      if (balances && balances.USD && balances.USD.total === 0 && this.defaultBalances.USD && this.defaultBalances.USD.total > 0) {
+        this.logger.debug('Detected zero USD balance, using default balance', {
+          defaultUsdBalance: this.defaultBalances.USD
+        });
+        balances.USD = { ...this.defaultBalances.USD };
+        
+        // Update the balance in memory manager
+        if (this.memoryManager) {
+          this.memoryManager.addBalance('current_balances', balances);
+          this.logger.debug('Updated balances in memory manager with default USD balance', {
+            updatedBalances: JSON.stringify(balances)
+          });
+        }
+      }
+      
+      this.logger.info('Starting order execution', {
+        action: decision.action,
+        side: decision.side,
+        price: decision.price,
+        size: decision.size,
+        reason: decision.reason,
+        symbol: this.symbol,
+        hasExchange: !!this.exchange,
+        exchangeType: this.exchange?.constructor?.name || 'Unknown'
+      });
+      
+      // Check if we should place an order
+      if (!decision.shouldTrade) {
+        this.logger.info('No trade indicated by decision', { reason: decision.reason });
+        
+        // Cancel existing orders if needed
+        if (this.activeOrders.buy || this.activeOrders.sell) {
+          await this._cancelAllOrders('Trading decision paused trading');
+          results.canceled = Object.values(this.activeOrders).filter(Boolean);
+          this.activeOrders = { buy: null, sell: null };
+        }
+        
+        results.executionTime = Date.now() - startTime;
+        return results;
+      }
+      
+      // Place order based on decision
+      if (decision.side === 'buy') {
+        // Check if we have enough balance unless force trading is enabled
+        const quoteBalance = balances?.[this.quoteCurrency]?.available || 0;
+        const orderValue = decision.price * decision.size;
+        const forceTrade = decision.marketConditions?.forceTrade === true;
+        
+        // When balances are zero but forceTrade is enabled, use default balances
+        if (quoteBalance === 0 && forceTrade) {
+          this.logger.info('Zero balance detected with force trading enabled, using default balance', {
+            defaultBalance: this.initialBalance,
+            currency: this.quoteCurrency
+          });
+          
+          // Create default balances for paper trading
+          balances = {
+            [this.quoteCurrency]: { available: this.initialBalance, total: this.initialBalance },
+            [this.baseCurrency]: { available: 1, total: 1 }
+          };
+        }
+        
+        // Re-check balance after potential update
+        const updatedQuoteBalance = balances?.[this.quoteCurrency]?.available || 0;
+        
+        if (updatedQuoteBalance < orderValue && !forceTrade) {
+          this.logger.warn('Insufficient balance for buy order', {
+            required: orderValue,
+            available: updatedQuoteBalance,
+            currency: this.quoteCurrency,
+            forceTrade
+          });
+          
+          results.error = 'Insufficient balance';
+          results.executionTime = Date.now() - startTime;
+          return results;
+        }
+        
+        if (forceTrade && quoteBalance < orderValue) {
+          this.logger.info('Force trading enabled: bypassing balance check for buy order', {
+            required: orderValue,
+            available: quoteBalance,
+            currency: this.quoteCurrency
+          });
+        }
+        
+        this.logger.debug('About to call _placeBuyOrder', {
+          price: decision.price,
+          size: decision.size,
+          hasMarketData: !!marketData,
+          forceTrade,
+          hasExchange: !!this.exchange,
+          exchangeType: this.exchange?.constructor?.name || 'Unknown',
+        });
+        
+        try {
+          results.buy = await this._placeBuyOrder(
+            decision.price, 
+            decision.size,
+            marketData
+          );
+          
+          this.logger.info('Successfully placed BUY order', {
+            orderId: results.buy?.id,
+            price: results.buy?.price,
+            size: results.buy?.amount,
+            status: results.buy?.status
+          });
+        } catch (error) {
+          this.logger.error('Error placing buy order', { 
+            error: error.message,
+            stack: error.stack,
+            price: decision.price,
+            size: decision.size,
+            symbol: this.symbol
+          });
+          results.error = error.message;
+        }
+      } else if (decision.side === 'sell') {
+        // Check if we have enough balance unless force trading is enabled
+        const baseBalance = balances?.[this.baseCurrency]?.available || 0;
+        const forceTrade = decision.marketConditions?.forceTrade === true;
+        
+        if (baseBalance < decision.size && !forceTrade) {
+          this.logger.warn('Insufficient balance for sell order', {
+            required: decision.size,
+            available: baseBalance,
+            currency: this.baseCurrency,
+            forceTrade
+          });
+          
+          results.error = 'Insufficient balance';
+          results.executionTime = Date.now() - startTime;
+          return results;
+        }
+        
+        if (forceTrade && baseBalance < decision.size) {
+          this.logger.info('Force trading enabled: bypassing balance check for sell order', {
+            required: decision.size,
+            available: baseBalance,
+            currency: this.baseCurrency
+          });
+        }
+        
+        this.logger.debug('About to call _placeSellOrder', {
+          price: decision.price,
+          size: decision.size,
+          hasMarketData: !!marketData,
+          forceTrade,
+          hasExchange: !!this.exchange,
+          exchangeType: this.exchange?.constructor?.name || 'Unknown',
+          symbol: this.symbol
+        });
+        
+        // Check if exchange is available
+        if (!this.exchange) {
+          this.logger.error('Cannot place sell order: exchange adapter is not available');
+          results.error = 'Exchange adapter not available';
+        } else {
+          try {
+            // Place sell order
+            results.sell = await this._placeSellOrder(decision.price, decision.size, marketData);
+            
+            this.logger.debug('_placeSellOrder result', {
+              success: !!results.sell,
+              orderId: results.sell?.id
+            });
+          } catch (sellError) {
+            this.logger.error('Error in _placeSellOrder', {
+              error: sellError.message,
+              stack: sellError.stack
+            });
+            results.error = sellError.message;
+          }
+        }
+      }
+      
+      results.executionTime = Date.now() - startTime;
+      
+      this.logger.info('Order execution complete', {
+        executionTime: `${results.executionTime}ms`,
+        buyOrderPlaced: results.buy ? true : false,
+        sellOrderPlaced: results.sell ? true : false,
+        canceledOrders: results.canceled.length,
+        error: results.error || 'none'
+      });
+      
+      return results;
+    } catch (error) {
+      this.logger.error('Error executing order', {
+        error: error.message,
+        stack: error.stack
+      });
+      
+      return {
+        buy: null,
+        sell: null,
+        canceled: [],
+        error: error.message,
+        executionTime: Date.now() - startTime
+      };
+    }
+  }
+  
+  /**
+   * Place a buy order
+   * @param {number} price Order price
+   * @param {number} size Order size
+   * @param {Object} marketData Current market data
+   * @returns {Promise<Object>} Placed order
+   * @private
+   */
+  async _placeBuyOrder(price, size, marketData) {
+    try {
+      this.logger.debug('Starting buy order placement', {
+        rawPrice: price,
+        rawSize: size,
+        marketDataPresent: !!marketData,
+        symbol: this.symbol,
+        exchangeType: this.exchange?.constructor?.name || 'Unknown'
+      });
+      
+      // Format price and size
+      const formattedPrice = this._formatPrice(price);
+      const formattedSize = this._formatSize(size);
+      const orderValue = formattedPrice * formattedSize;
+      
+      this.logger.info('Placing buy order', {
+        price: formattedPrice,
+        size: formattedSize,
+        value: orderValue,
+        symbol: this.symbol
+      });
+      
+      // Cancel existing buy order if present
+      if (this.activeOrders.buy) {
+        await this._cancelOrder(this.activeOrders.buy.id, 'Replacing with new buy order');
+      }
+      
+      // Create order parameters
+      const orderParams = {
+        symbol: this.symbol,
+        type: 'limit',
+        side: 'buy',
+        amount: formattedSize,
+        price: formattedPrice
+      };
+      
+      // Add detailed debugging before placing the order
+      this.logger.debug('About to place buy order through exchange adapter', {
+        symbol: this.symbol,
+        type: 'limit',
+        side: 'buy',
+        size: formattedSize,
+        price: formattedPrice,
+        exchangeType: this.exchange?.constructor?.name || 'Unknown'
+      });
+      
+      // Log order parameters before creation
+      this.logger.debug('Preparing to create order through exchange adapter', {
+        symbol: this.symbol,
+        type: 'limit',
+        side: 'buy',
+        size: formattedSize,
+        price: formattedPrice,
+        exchangeType: this.exchange?.constructor?.name || 'Unknown',
+        hasExchange: !!this.exchange
+      });
+      
+      if (!this.symbol) {
+        throw new Error('Symbol is required for order placement');
+      }
+      
+      if (!this.exchange) {
+        throw new Error('Exchange adapter is required for order placement');
+      }
+      
+      // Place order through exchange adapter
+      const order = await this.exchange.createOrder(
+        this.symbol,
+        'limit',
+        'buy',
+        formattedSize,
+        formattedPrice
+      );
+      
+      // Add detailed debugging after placing the order
+      this.logger.debug('Buy order placement result', {
+        orderId: order?.id,
+        status: order?.status,
+        success: !!order,
+        symbol: this.symbol,
+        price: formattedPrice,
+        size: formattedSize,
+        value: orderValue
+      });
+      
+      // Store order in memory manager if available
+      if (this.memoryManager) {
+        try {
+          // Get existing orders array or create new one
+          let orders = this.memoryManager.getOrder('orders') || [];
+          
+          // Add new order to array
+          orders.push(order);
+          
+          // Store updated array
+          this.memoryManager.addOrder('orders', orders);
+          this.logger.debug('Stored buy order in memory manager', { orderId: order.id });
+        } catch (memoryError) {
+          this.logger.warn('Error storing order in memory manager', {
+            error: memoryError.message,
+            orderId: order.id
+          });
+        }
+      }
+      
+      // Update active orders
+      this.activeOrders.buy = order;
+      
+      this.logger.info('Buy order placed successfully', {
+        orderId: order.id,
+        price: formattedPrice,
+        size: formattedSize
+      });
+      
+      return order;
+    } catch (error) {
+      this.logger.error('Error placing buy order', {
+        error: error.message,
+        stack: error.stack
+      });
+      
+      throw error;
+    }
+  }
+  
+  /**
+   * Place a sell order
+   * @param {number} price Order price
+   * @param {number} size Order size
+   * @param {Object} marketData Current market data
+   * @returns {Promise<Object>} Placed order
+   * @private
+   */
+  async _placeSellOrder(price, size, marketData) {
+    try {
+      // Format price and size
+      const formattedPrice = this._formatPrice(price);
+      const formattedSize = this._formatSize(size);
+      
+      this.logger.info('Placing sell order', {
+        price: formattedPrice,
+        size: formattedSize,
+        value: formattedPrice * formattedSize
+      });
+      
+      // Cancel existing sell order if present
+      if (this.activeOrders.sell) {
+        await this._cancelOrder(this.activeOrders.sell.id, 'Replacing with new sell order');
+      }
+      
+      // Create order parameters
+      const orderParams = {
+        symbol: this.symbol,
+        type: 'limit',
+        side: 'sell',
+        amount: formattedSize,
+        price: formattedPrice
+      };
+      
+      // Add detailed debugging before placing the order
+      this.logger.debug('About to place sell order through exchange adapter', {
+        symbol: this.symbol,
+        type: 'limit',
+        side: 'sell',
+        size: formattedSize,
+        price: formattedPrice,
+        exchangeType: this.exchange?.constructor?.name || 'Unknown'
+      });
+      
+      // Place order through exchange adapter
+      const order = await this.exchange.createOrder(
+        this.symbol,
+        'limit',
+        'sell',
+        formattedSize,
+        formattedPrice
+      );
+      
+      // Add detailed debugging after placing the order
+      this.logger.debug('Sell order placement result', {
+        orderId: order?.id,
+        status: order?.status,
+        success: !!order
+      });
+      
+      // Store order in memory manager if available
+      if (this.memoryManager) {
+        try {
+          // Get existing orders array or create new one
+          let orders = this.memoryManager.getOrder('orders') || [];
+          
+          // Add new order to array
+          orders.push(order);
+          
+          // Store updated array
+          this.memoryManager.addOrder('orders', orders);
+          this.logger.debug('Stored sell order in memory manager', { orderId: order.id });
+        } catch (memoryError) {
+          this.logger.warn('Error storing order in memory manager', {
+            error: memoryError.message,
+            orderId: order.id
+          });
+        }
+      }
+      
+      // Update active orders
+      this.activeOrders.sell = order;
+      
+      this.logger.info('Sell order placed successfully', {
+        orderId: order.id,
+        price: formattedPrice,
+        size: formattedSize
+      });
+      
+      return order;
+    } catch (error) {
+      this.logger.error('Error placing sell order', {
+        error: error.message,
+        stack: error.stack
+      });
+      
+      throw error;
+    }
+  }
+  
+  /**
+   * Cancel an order
+   * @param {string} orderId Order ID to cancel
+   * @param {string} reason Reason for cancellation
+   * @returns {Promise<Object>} Canceled order
+   * @private
+   */
+  async _cancelOrder(orderId, reason = 'User requested') {
+    try {
+      this.logger.info('Canceling order', { orderId, reason });
+      
+      // Cancel order through exchange adapter
+      await this.exchange.cancelOrder(orderId);
+      
+      // Find which type of order was canceled
+      let orderType = null;
+      if (this.activeOrders.buy && this.activeOrders.buy.id === orderId) {
+        orderType = 'buy';
+        this.activeOrders.buy = null;
+      } else if (this.activeOrders.sell && this.activeOrders.sell.id === orderId) {
+        orderType = 'sell';
+        this.activeOrders.sell = null;
+      }
+      
+      // Update order in memory manager if available
+      if (this.memoryManager) {
+        try {
+          // Get existing orders array
+          let orders = this.memoryManager.getOrder('orders') || [];
+          
+          // Find and update the canceled order
+          const orderIndex = orders.findIndex(o => o.id === orderId);
+          if (orderIndex >= 0) {
+            orders[orderIndex].status = OrderStatus.CANCELED;
+            orders[orderIndex].cancelReason = reason;
+            
+            // Store updated array
+            this.memoryManager.addOrder('orders', orders);
+            this.logger.debug('Updated canceled order in memory manager', { orderId });
+          }
+        } catch (memoryError) {
+          this.logger.warn('Error updating canceled order in memory manager', {
+            error: memoryError.message,
+            orderId
+          });
+        }
+      }
+      
+      this.logger.info('Order canceled successfully', { orderId, orderType });
+      
+      return { id: orderId, status: OrderStatus.CANCELED, type: orderType };
+    } catch (error) {
+      this.logger.error('Error canceling order', {
+        orderId,
+        error: error.message,
+        stack: error.stack
+      });
+      
+      throw error;
+    }
+  }
+  
+  /**
+   * Cancel all active orders
+   * @param {string} reason Reason for cancellation
+   * @returns {Promise<Array>} Canceled orders
+   * @private
+   */
+  async _cancelAllOrders(reason = 'User requested') {
+    try {
+      this.logger.info('Canceling all active orders', { reason });
+      
+      const canceledOrders = [];
+      
+      // Cancel buy order if active
+      if (this.activeOrders.buy) {
+        const canceledBuy = await this._cancelOrder(this.activeOrders.buy.id, reason);
+        canceledOrders.push(canceledBuy);
+      }
+      
+      // Cancel sell order if active
+      if (this.activeOrders.sell) {
+        const canceledSell = await this._cancelOrder(this.activeOrders.sell.id, reason);
+        canceledOrders.push(canceledSell);
+      }
+      
+      this.logger.info('All orders canceled successfully', { count: canceledOrders.length });
+      
+      return canceledOrders;
+    } catch (error) {
+      this.logger.error('Error canceling all orders', {
+        error: error.message,
+        stack: error.stack
+      });
+      
+      throw error;
+    }
+  }
+  
+  /**
+   * Format price to exchange precision
+   * @param {number} price Price to format
+   * @returns {number} Formatted price
+   * @private
+   */
+  _formatPrice(price) {
+    return parseFloat(price.toFixed(this.pricePrecision));
+  }
+  
+  /**
+   * Format size to exchange precision
+   * @param {number} size Size to format
+   * @returns {number} Formatted size
+   * @private
+   */
+  _formatSize(size) {
+    return parseFloat(size.toFixed(this.sizePrecision));
+  }
+
+  /**
+   * Generate mock trades for testing in dry run mode
+   * @param {number} count Number of mock trades to generate
+   * @returns {Array<Object>} Array of mock trades
+   */
+  generateMockTrades(count = 5) {
+    const now = Date.now();
+    const mockTrades = [];
+    const basePrice = 60000 + Math.random() * 2000 - 1000; // Around 60000 +/- 1000
+    
+    for (let i = 0; i < count; i++) {
+      // Generate a slightly different price for each trade
+      const priceVariation = (Math.random() * 100) - 50;
+      const price = basePrice + priceVariation;
+      
+      // Generate a random volume between 0.001 and 0.5 BTC
+      const volume = (0.001 + Math.random() * 0.499).toFixed(6);
+      
+      // Random timestamp in the last minute
+      const timestamp = now - (i * 1000) - Math.floor(Math.random() * 5000);
+      
+      // Random side (buy/sell)
+      const side = Math.random() > 0.5 ? 'buy' : 'sell';
+      
+      // Create the mock trade
+      mockTrades.push({
+        id: `mock-trade-${timestamp}`,
+        price: price,
+        volume: parseFloat(volume),
+        timestamp: timestamp,
+        side: side,
+        type: 'market',
+        symbol: this.symbol
+      });
+    }
+    
+    return mockTrades;
+  }
+
+  /**
+   * Cancel all active orders
+   * @param {string} reason Reason for cancellation
+   * @param {Object} activeOrders Current active orders {bid, ask}
+   * @returns {Promise<{bid: Object|null, ask: Object|null}>} Updated active orders
+   */
+  async cancelAllOrders(reason, activeOrders) {
+    this.logger.info('Cancelling all active orders', { reason });
+    
+    try {
+      // Track cancellation performance
+      const opId = `cancel-all-orders-${Date.now()}`;
+      this.performanceTracker.startTiming(opId, 'orderCancellation', { reason });
+      
+      const ordersToCancel = [];
+      
+      // Add bid order if active
+      if (activeOrders.bid) {
+        ordersToCancel.push(activeOrders.bid);
+      }
+      
+      // Add ask order if active
+      if (activeOrders.ask) {
+        ordersToCancel.push(activeOrders.ask);
+      }
+      
+      if (ordersToCancel.length === 0) {
+        this.logger.info('No active orders to cancel');
+        this.performanceTracker.completeTiming(opId, true, { ordersCount: 0 });
+        return { bid: null, ask: null };
+      }
+      
+      this.logger.info(`Cancelling ${ordersToCancel.length} active orders`, {
+        orderIds: ordersToCancel.map(order => order.id)
+      });
+      
+      // Cancel each order
+      const cancelPromises = ordersToCancel.map(order => {
+        return this.exchange.cancelOrder(order.id, this.symbol)
+          .then(() => {
+            this.logger.info(`Successfully cancelled order ${order.id}`);
+            
+            // Update order status
+            order.status = OrderStatus.CANCELLED;
+            order.statusReason = reason;
+            
+            // Store in memory manager if available
+            if (this.memoryManager) {
+              this.memoryManager.updateOrder(order.id, order);
+            }
+            
+            return order;
+          })
+          .catch(error => {
+            this.logger.error(`Failed to cancel order ${order.id}`, {
+              error: error.message,
+              orderId: order.id
+            });
+            throw error;
+          });
+      });
+      
+      await Promise.all(cancelPromises);
+      
+      this.logger.info('Successfully cancelled all active orders');
+      this.performanceTracker.completeTiming(opId, true, { ordersCount: ordersToCancel.length });
+      
+      return { bid: null, ask: null };
+    } catch (error) {
+      this.logger.error('Error cancelling orders', {
+        error: error.message,
+        stack: error.stack
+      });
+      throw error;
+    }
+  }
+}
+
+export default OrderExecutionEngine;
