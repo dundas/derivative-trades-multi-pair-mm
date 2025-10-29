@@ -1,0 +1,54 @@
+{
+  "name": "derivative-trades-multi-pair-mm",
+  "version": "1.0.0",
+  "description": "Multi-Pair Opportunistic Market Maker - Multi-exchange algorithmic trading system",
+  "type": "module",
+  "main": "src/core/MultiPairOpportunisticTrader.js",
+  "scripts": {
+    "start": "node src/core/MultiPairOpportunisticTrader.js",
+    "start:enhanced": "node src/core/enhanced-multi-pair-trader.js",
+    "test": "node --test tests/**/*.test.js",
+    "analyze:pairs": "node src/core/quick-pair-analysis.js",
+    "validate:edge": "node src/core/simple-edge-validation.js",
+    "select:pairs": "node src/core/intelligent-pair-discovery.js"
+  },
+  "keywords": [
+    "market-maker",
+    "multi-pair",
+    "algorithmic-trading",
+    "kraken",
+    "crypto-trading",
+    "opportunistic-trading",
+    "derivatives",
+    "bitcoin",
+    "multi-exchange"
+  ],
+  "author": "Derivative Trades",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "ioredis": "^5.3.2",
+    "joi": "^17.11.0",
+    "pg": "^8.11.3",
+    "uuid": "^9.0.1",
+    "winston": "^3.11.0",
+    "ws": "^8.14.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "eslint": "^8.55.0",
+    "prettier": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dundas/derivative-trades-multi-pair-mm.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dundas/derivative-trades-multi-pair-mm/issues"
+  },
+  "homepage": "https://github.com/dundas/derivative-trades-multi-pair-mm#readme"
+}
